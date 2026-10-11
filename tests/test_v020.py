@@ -147,7 +147,7 @@ async def test_burst_cancels_exact_old_gate_task_not_latest(env):
     env.plugin.client.evaluate = AsyncMock(side_effect=judge)
     first, second = (
         base.event(mid="a", text="第一句"),
-        base.event(mid="b", text="第二句"),
+        base.event(mid="b", text="第一句的补充"),
     )
     task = asyncio.create_task(env.plugin.on_message(first))
     await entered.wait()

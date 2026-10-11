@@ -20,7 +20,7 @@ from astrbot.core.agent.message import TextPart
 from astrbot.core.star.star_tools import StarTools
 
 from . import bridge, silence, burst
-from .admission import guard_exempt, input_decision
+from .admission import guard_exempt, input_decision, local_prefilter, related_topic
 from .client import DecisionError, JevClient
 from .delivery import DeliveryDeclined, EventBotProxy, SplitAdapters
 from .policy import (
@@ -32,8 +32,17 @@ from .policy import (
     questions_for,
     natural_decide,
 )
-from .state import Ledger, RoomBook, scope_id
-from .settings import ConfigView
+from .state import Ledger, RoomBook, scope_id, audit_preview
+from .telemetry import Metrics
+from .settings import ConfigView, migrate_config_file
+from pathlib import Path
+from astrbot.core.utils.astrbot_path import get_astrbot_config_path
+
+# StarManager imports this module before constructing AstrBotConfig.
+if __package__ and __package__.startswith("data.plugins."):
+    migrate_config_file(
+        Path(get_astrbot_config_path()) / (Path(__file__).parent.name + "_config.json")
+    )
 
 MARK = "_jev_active_reply_v1"
 NORMAL = "_jev_observed_response"
@@ -62,6 +71,8 @@ class JevActiveReply(Star):
         self.split_adapters = SplitAdapters(MARK)
         self.ignored_background = silence.IgnoredBackground()
         self.config_lock = asyncio.Lock()
+        self.metrics = Metrics()
+        self.summary_timer = None
 
     def _cfg(self, key, default):
         return self.config.get(key, default)
@@ -227,6 +238,10 @@ class JevActiveReply(Star):
                 "elapsed_ms": round((time.monotonic() - meta["created"]) * 1000),
             }
         self.audit_queue.append((event.unified_msg_origin, reason, details))
+        if reason == "adapter_send_completed":
+            self.metrics.replies += 1
+        elif reason == "delivery_failed_or_cancelled":
+            self.metrics.failures += 1
         if self.audit_task is None or self.audit_task.done():
             self.audit_task = asyncio.create_task(self._drain_audit())
 
@@ -241,6 +256,39 @@ class JevActiveReply(Star):
                         "[JevActive] audit storage unavailable; conversational delivery remains isolated"
                     )
                     self.last_storage_warning = time.monotonic()
+
+    def _summary_tick(self):
+        if self.closed:
+            return
+        logger.info(
+            "[JevActive] hourly summary decisions=%d replies=%d p95_latency_ms=%d failures=%d",
+            *self.metrics.take(),
+        )
+        self.summary_timer = asyncio.get_running_loop().call_later(
+            3600, self._summary_tick
+        )
+
+    async def _judge(self, event, state, questions):
+        started, error = time.monotonic(), None
+        try:
+            return await self.client.evaluate(state, questions)
+        except asyncio.CancelledError:
+            error = "cancelled"
+            raise
+        except Exception as exc:
+            error = exc.code if isinstance(exc, DecisionError) else "internal_error"
+            raise
+        finally:
+            elapsed = (time.monotonic() - started) * 1000
+            if self.metrics.decision(elapsed, error):
+                logger.warning(
+                    "[JevActive] Jev transport failed three consecutive times"
+                )
+            self._note(
+                event,
+                "jev_evaluation",
+                {"stage_ms": round(elapsed), "status": error or "ok"},
+            )
 
     def _release(self, event):
         meta = event.get_extra(MARK)
@@ -293,7 +341,15 @@ class JevActiveReply(Star):
             or room.pending != meta["ticket"]
             or (
                 not meta.get("committed")
-                and room.generation != meta.get("approved_generation")
+                and self._related_generation(
+                    room,
+                    {
+                        **meta,
+                        "generation": meta.get(
+                            "approved_generation", meta["generation"]
+                        ),
+                    },
+                )
             )
         ):
             self._reject(event, None, "delivery_context_changed")
@@ -310,6 +366,40 @@ class JevActiveReply(Star):
                 or room.quiet_senders.get(str(event.get_sender_id()), 0) > now
             )
         )
+
+    @staticmethod
+    def _related_generation(room, meta):
+        baseline = meta.get("generation", 0)
+        if not room or room.generation == baseline:
+            return False
+        rows = [r for r in room.rows if r.get("generation", 0) > baseline]
+        if len(rows) != room.generation - baseline:
+            return True  # Lost history or a quiet/recall generation: revalidate.
+        target = meta.get("state", {}).get("target_message", {})
+        text = str(target.get("content", "")) + " " + str(meta.get("draft", ""))
+        for row in rows:
+            if not row.get("sender_id"):
+                return True
+            if row.get("reply_to") in {target.get("sender_id"), meta.get("bot_id")}:
+                return True
+            content = str(row.get("content", ""))
+            if related_topic(text, content):
+                return True
+            if row.get("sender_id") == target.get("sender_id") and content.startswith(
+                (
+                    "不对",
+                    "更正",
+                    "算了",
+                    "别回",
+                    "我是说",
+                    "补充",
+                    "还有",
+                    "这个",
+                    "那个",
+                )
+            ):
+                return True
+        return False
 
     async def _load_quiet(self, event, room):
         async with room.quiet_lock:
@@ -350,6 +440,7 @@ class JevActiveReply(Star):
             room.last_sent = time.monotonic()
             room.last_sender = str(event.get_sender_id())
             room.last_text = meta.get("draft", "")
+            room.last_judged_text = ""
             room.sent_times.append(room.last_sent)
             room.rows.append(
                 {
@@ -448,7 +539,7 @@ class JevActiveReply(Star):
         if self._cfg("dry_run", False) or not self._cfg("burst_merge_enabled", True):
             return
         now = time.monotonic()
-        seconds = min(30, max(0, float(self._cfg("burst_window_seconds", 5))))
+        seconds = min(30, max(0, float(self._cfg("burst_window_seconds", 10))))
         sender = str(event.get_sender_id())
         previous = room.bursts.get(sender, cid, now)
         text = (
@@ -461,6 +552,24 @@ class JevActiveReply(Star):
             and not previous.closed
             and not previous.committed
             and not previous.sending
+            and (
+                related_topic(" ".join(previous.texts), text)
+                or text.startswith(
+                    (
+                        "还有",
+                        "补充",
+                        "这个",
+                        "那个",
+                        "不对",
+                        "更正",
+                        "我是说",
+                        "就是",
+                        "再看",
+                        "图里",
+                        "第二张",
+                    )
+                )
+            )
             and now - previous.last <= seconds
             and now - previous.started <= 30
             and len(previous.ids)
@@ -534,6 +643,10 @@ class JevActiveReply(Star):
         room.bursts.put(frame)
 
     async def initialize(self):
+        if self.summary_timer is None:
+            self.summary_timer = asyncio.get_running_loop().call_later(
+                3600, self._summary_tick
+            )
         logger.info(
             "[JevActive] loaded in %s mode; both channel pools ready; no startup API probe",
             "shadow" if self._cfg("dry_run", False) else "live",
@@ -674,6 +787,10 @@ class JevActiveReply(Star):
         if self._quiet(event, room):
             return
         target = self._outline(event)
+        reason = local_prefilter(event, self.config)
+        if reason:
+            self._note(event, reason)
+            return
         if len(str(target).encode()) > 262144:
             self._note(event, "incoming_text_too_large")
             return
@@ -744,6 +861,17 @@ class JevActiveReply(Star):
                 return
             if self._blocked(event):
                 return
+            if room.cid == cid:
+                reason = local_prefilter(
+                    event,
+                    self.config,
+                    room.last_judged_text,
+                    room.last_judged_at,
+                    time.monotonic(),
+                )
+                if reason:
+                    self._note(event, reason)
+                    return
             self._coalesce(event, room, cid)
         if generation != room.generation or self._blocked(event):
             return
@@ -797,7 +925,7 @@ class JevActiveReply(Star):
             if event.get_extra("_jev_merged_message_ids")
             else max(
                 0,
-                min(30, max(1, float(self._cfg("evaluation_interval", 4))))
+                min(30, max(1, float(self._cfg("evaluation_interval", 10))))
                 - (now - room.evaluated_at),
             )
         )
@@ -865,6 +993,7 @@ class JevActiveReply(Star):
                 room.last_sent = 0
                 room.last_sender = ""
                 room.last_text = ""
+                room.last_judged_text = ""
                 room.cid = cid
                 state["activity"]["last_delivered_reply"] = ""
                 state["activity"]["last_reply_to"] = ""
@@ -892,8 +1021,8 @@ class JevActiveReply(Star):
                 verdict = Verdict(True, "perceive", "native_visual_adjudication")
             else:
                 try:
-                    response = await self.client.evaluate(
-                        state, questions_for(self.config)
+                    response = await self._judge(
+                        event, state, questions_for(self.config)
                     )
                 except DecisionError as exc:
                     self._note(event, exc.code, {"status": exc.status})
@@ -919,16 +1048,22 @@ class JevActiveReply(Star):
                     and values["intrusive"] <= 0.25
                 ):
                     verdict = Verdict(True, "adjudicate", "native_context_adjudication")
+            details = {
+                **response,
+                "mode": verdict.mode,
+                "truncated": state["truncated"],
+                "stage_ms": round((time.monotonic() - decision_started) * 1000),
+            }
+            if self._boundary_decision(response.get("values", {}), recent):
+                details["trigger_preview"] = audit_preview(target.get("content", ""))
             self._note(
                 event,
                 verdict.reason,
-                {
-                    **response,
-                    "mode": verdict.mode,
-                    "truncated": state["truncated"],
-                    "stage_ms": round((time.monotonic() - decision_started) * 1000),
-                },
+                details,
             )
+            if not verdict.speak:
+                room.last_judged_text = str(target.get("content", ""))[:4096]
+                room.last_judged_at = time.monotonic()
             if not verdict.speak or self._cfg("dry_run", False):
                 return
             if bridge.native_busy(event):
@@ -968,6 +1103,7 @@ class JevActiveReply(Star):
                 MARK,
                 {
                     "ticket": ticket,
+                    "bot_id": str(event.get_self_id()),
                     "cid": cid,
                     "state": state,
                     "created": now,
@@ -1021,6 +1157,39 @@ class JevActiveReply(Star):
         if room:
             room.release(meta["ticket"])
         self._note(event, reason)
+
+    def _boundary_decision(self, values, recent=0):
+        if self._cfg("decision_mode", "classic") == "natural":
+            threshold = float(self._cfg("natural_reply_threshold", 0.5))
+            threshold += {"quiet": 0.1, "balanced": 0, "sociable": -0.05}.get(
+                self._cfg("style", "balanced"), 0
+            )
+            thresholds = [("reply_now", min(0.95, max(0.05, threshold)))]
+        else:
+            thresholds = [
+                (name, float(self._cfg(key, default)))
+                for name, key, default in (
+                    ("addressed", "address_threshold", 0.8),
+                    ("continuation", "continuation_threshold", 0.7),
+                    ("worthwhile", "response_value_threshold", 0.5),
+                    ("intrusive", "intrusion_threshold", 0.45),
+                )
+            ]
+            join = {"quiet": 0.86, "balanced": 0.78, "sociable": 0.70}.get(
+                self._cfg("style", "balanced"), 0.78
+            )
+            join += float(self._cfg("join_threshold_offset", 0)) + 0.06 * recent
+            thresholds.extend(
+                [
+                    ("worthwhile", min(0.99, max(0.1, join))),
+                    ("intrusive", float(self._cfg("join_intrusion_ceiling", 0.2))),
+                ]
+            )
+        return any(
+            isinstance(values.get(name), (int, float))
+            and abs(values[name] - threshold) <= 0.0800000001
+            for name, threshold in thresholds
+        )
 
     def _expire(self, event):
         meta = event.get_extra(MARK)
@@ -1261,7 +1430,7 @@ class JevActiveReply(Star):
         meta["draft"] = text
         meta["response"] = response
         review = self._cfg("second_review", "always")
-        changed = room is None or room.generation != meta["generation"]
+        changed = room is None or self._related_generation(room, meta)
         if review == "adaptive":
             if len(text) > max(
                 200, min(20000, int(self._cfg("max_autonomous_reply_chars", 2000)))
@@ -1324,8 +1493,8 @@ class JevActiveReply(Star):
                 "reviewer_received_images": False,
                 "limitation": "Do not independently verify pixel facts: this reviewer is text-only. Image details are not automatically invented if the main model received images.",
             }
-            result = await self.client.evaluate(
-                state, questions_for(self.config, review=True)
+            result = await self._judge(
+                event, state, questions_for(self.config, review=True)
             )
             self._note(event, "review_result", result)
             if result["values"]["appropriate"] < float(
@@ -1337,7 +1506,9 @@ class JevActiveReply(Star):
                 return
             fresh_cid, _ = await bridge.conversation(self.context, event)
             if (
-                generation != room.generation
+                self._related_generation(
+                    room, {**meta, "generation": generation, "draft": text}
+                )
                 or self._blocked(event)
                 or (meta["cid"] and fresh_cid != meta["cid"])
             ):
@@ -1372,13 +1543,13 @@ class JevActiveReply(Star):
                 "main_model_received_images": meta.get("visual_access", False),
                 "reviewer_received_images": False,
             }
-            result = await self.client.evaluate(
-                state, questions_for(self.config, freshness=True)
+            result = await self._judge(
+                event, state, questions_for(self.config, freshness=True)
             )
             self._note(event, "freshness_result", result)
             cid, _ = await bridge.conversation(self.context, event)
             if (
-                room.generation != generation
+                self._related_generation(room, {**meta, "generation": generation})
                 or self._blocked(event)
                 or (meta["cid"] and cid != meta["cid"])
             ):
@@ -1648,7 +1819,7 @@ class JevActiveReply(Star):
             await asyncio.shield(self.audit_task)
         pools = [pool.status() for pool in self.client.pools.values()]
         lines = [
-            "Jev 主动回复插件 0.8.0 · 木有知",
+            "Jev 主动回复插件 0.9.0 · 木有知",
             f"当前群：{'已启用' if self._enabled(event) else '未启用'}",
         ]
         for p in pools:
@@ -1673,7 +1844,7 @@ class JevActiveReply(Star):
             )
         )
         lines.append(
-            f"判断：{self._cfg('decision_mode', 'classic')}；复查：{self._cfg('second_review', 'always')}；同人补充窗口：{self._cfg('burst_window_seconds', 5)} 秒"
+            f"判断：{self._cfg('decision_mode', 'classic')}；复查：{self._cfg('second_review', 'always')}；同人补充窗口：{self._cfg('burst_window_seconds', 10)} 秒"
         )
         if not await self.client.review_ready():
             lines.append(
@@ -1683,6 +1854,9 @@ class JevActiveReply(Star):
         yield event.plain_result("\n".join(lines))
 
     async def terminate(self):
+        if self.summary_timer:
+            self.summary_timer.cancel()
+            self.summary_timer = None
         self.closed = True
         for event in list(self.pending_events.values()):
             event.set_extra("agent_stop_requested", True)

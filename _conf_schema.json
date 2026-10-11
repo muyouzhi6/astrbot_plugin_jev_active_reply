@@ -178,7 +178,7 @@
   },
   "burst_window_seconds": {
     "type": "float",
-    "default": 5,
+    "default": 10,
     "description": "连续消息合并窗口（秒）",
     "hint": "同一人短时间内补充消息时合并，减少重复回复；首条不必等满窗口。",
     "invisible": false
@@ -298,7 +298,7 @@
         "items": {
           "decision_mode": {
             "type": "string",
-            "default": null,
+            "default": "natural",
             "options": [
               "natural",
               "classic"
@@ -308,7 +308,7 @@
           },
           "second_review": {
             "type": "string",
-            "default": null,
+            "default": "adaptive",
             "options": [
               "adaptive",
               "off",
@@ -327,75 +327,75 @@
           },
           "natural_reply_threshold": {
             "type": "float",
-            "default": null,
+            "default": 0.5,
             "description": "自然判断基础门槛（通常无需修改）",
             "hint": "活跃程度在此基础上调整。不是经校准的正确率。",
             "invisible": true
           },
           "question_overrides": {
             "type": "text",
-            "default": null,
+            "default": "",
             "description": "高级：判断问题措辞/标准覆盖 JSON",
             "hint": "可覆盖 reply_now、still_fits 或旧版六项判断，通常留空。不改变 noul 类型。",
             "invisible": true
           },
           "uncertain_adjudication": {
             "type": "bool",
-            "default": null,
-            "description": "边界候选交给拥有完整记忆的主模型再判断",
+            "default": true,
+            "description": "临界候选交给拥有完整记忆的主模型再判断",
             "invisible": true
           },
           "address_threshold": {
             "type": "float",
-            "default": null,
+            "default": 0.8,
             "description": "间接对 Bot 说话的门槛（0–1）",
             "invisible": true
           },
           "continuation_threshold": {
             "type": "float",
-            "default": null,
+            "default": 0.7,
             "description": "自然续聊门槛（0–1）",
             "invisible": true
           },
           "response_value_threshold": {
             "type": "float",
-            "default": null,
+            "default": 0.5,
             "description": "接话最低价值/自然反应分（0–1）",
             "invisible": true
           },
           "intrusion_threshold": {
             "type": "float",
-            "default": null,
+            "default": 0.45,
             "description": "打扰分达到此值则沉默（0–1）",
             "invisible": true
           },
           "join_threshold_offset": {
             "type": "float",
-            "default": null,
+            "default": 0,
             "description": "主动加入话题的门槛偏移，正值更克制",
             "invisible": true
           },
           "join_intrusion_ceiling": {
             "type": "float",
-            "default": null,
+            "default": 0.2,
             "description": "主动加入时允许的最高打扰分（0–1）",
             "invisible": true
           },
           "review_appropriate_threshold": {
             "type": "float",
-            "default": null,
+            "default": 0.75,
             "description": "二审合适程度最低分（0–1）",
             "invisible": true
           },
           "review_redundancy_ceiling": {
             "type": "float",
-            "default": null,
+            "default": 0.35,
             "description": "二审重复程度最高分（0–1）",
             "invisible": true
           },
           "image_decision_mode": {
             "type": "string",
-            "default": null,
+            "default": "text_gate",
             "options": [
               "native_vision",
               "text_gate"
@@ -410,7 +410,7 @@
           },
           "max_autonomous_reply_chars": {
             "type": "int",
-            "default": null,
+            "default": 2000,
             "description": "自主回复最长字符数，超出则沉默（200–20000）",
             "invisible": true
           }
@@ -422,68 +422,80 @@
         "items": {
           "debounce_seconds": {
             "type": "float",
-            "default": null,
+            "default": 0,
             "description": "首次判断前额外等待秒数（0–5）",
             "hint": "默认不固定等待。连续补充由下方窗口监听；这不是合并窗口。",
             "invisible": true
           },
           "burst_merge_enabled": {
             "type": "bool",
-            "default": null,
+            "default": true,
             "description": "同人连续补充合并：先判断生成，未输出时替换旧轮",
             "hint": "按群/会话/发送者独立管理，别人插话不混串。已发送或正在投递不合并重放；仅原生自主候选参与。",
             "invisible": true
           },
           "burst_max_messages": {
             "type": "int",
-            "default": null,
+            "default": 8,
             "description": "一次连续补充最多合并几条（2–12）",
             "invisible": true
           },
           "candidate_wait_seconds": {
             "type": "int",
-            "default": null,
+            "default": 15,
             "description": "最新候选等待当前自主轮收尾的上限（1–30秒）",
             "invisible": true
           },
           "continuation_min_interval": {
             "type": "float",
-            "default": null,
+            "default": 1,
             "description": "同人续聊最低间隔秒数（不作为自动回复许可）",
             "invisible": true
           },
           "request_lifetime_seconds": {
             "type": "int",
-            "default": null,
+            "default": 90,
             "description": "自主请求最长生命周期秒数（15–180）",
             "invisible": true
           },
           "evaluation_interval": {
             "type": "int",
-            "default": null,
+            "default": 10,
             "description": "同群 Jev 评估最小间隔秒数",
             "invisible": true
           },
           "min_reply_interval": {
             "type": "int",
-            "default": null,
+            "default": 8,
             "description": "主动插话间隔（秒）",
             "invisible": false,
             "hint": "避免连续主动插话；不是 API 请求限速。"
           },
           "continuation_seconds": {
             "type": "int",
-            "default": null,
+            "default": 180,
             "description": "自然续聊时间（秒）",
             "invisible": false,
             "hint": "刚参与过的话题，在这段时间内更容易继续接话。"
           },
           "direct_wake_interval": {
             "type": "float",
-            "default": null,
+            "default": 0.5,
             "description": "同人显式呼叫最低间隔秒数（0–10）",
             "hint": "保留旧唤醒冷却能力；0 关闭，不替代自主回复的合并窗口。豁免名单不受限制。",
             "invisible": true
+          },
+          "local_prefilter_enabled": {
+            "type": "bool",
+            "default": true,
+            "description": "Jev 前本地过滤",
+            "invisible": false
+          },
+          "prefilter_cooldown_seconds": {
+            "type": "float",
+            "default": 20,
+            "description": "同话题本地冷却秒数",
+            "invisible": false
           }
         }
       },
@@ -493,27 +505,27 @@
         "items": {
           "persona_override": {
             "type": "text",
-            "default": null,
+            "default": "",
             "description": "判断人设覆盖（一般留空自动读取）",
             "hint": "只影响 Jev 判断，不覆盖主模型人格；自动按 UMO 与 conversation 解析。",
             "invisible": true
           },
           "read_life_schedule": {
             "type": "bool",
-            "default": null,
+            "default": true,
             "description": "读取已有生活日程，不生成新日程",
             "invisible": true
           },
           "interest_topics": {
             "type": "list",
-            "default": null,
+            "default": [],
             "description": "人设补充兴趣主题",
             "hint": "仅作为语义判断背景，不是见词必回或随机唤醒。与人设冲突时以人设为准。",
             "invisible": true
           },
           "context_mode": {
             "type": "string",
-            "default": null,
+            "default": "quality",
             "options": [
               "quality",
               "balanced",
@@ -530,14 +542,14 @@
           },
           "context_message_limit": {
             "type": "int",
-            "default": null,
+            "default": 40,
             "description": "参考消息数",
             "invisible": false,
             "hint": "用于判断是否接话，不改变主模型的上下文配置。"
           },
           "overflow_evidence_policy": {
             "type": "string",
-            "default": null,
+            "default": "summarize",
             "options": [
               "summarize",
               "reject"
@@ -548,26 +560,26 @@
           },
           "overflow_summary_timeout": {
             "type": "int",
-            "default": null,
+            "default": 20,
             "description": "超预算辅助证据整理超时秒数（5–30）",
             "invisible": true
           },
           "protected_recent_messages": {
             "type": "int",
-            "default": null,
+            "default": 4,
             "description": "预算不足时保护的最近消息数（1–8）",
             "invisible": true
           },
           "context_safety_margin": {
             "type": "float",
-            "default": null,
+            "default": 0.15,
             "description": "估算 token 安全余量（0.05–0.4）",
             "hint": "不是供应商精确 tokenizer；同时检查 state+最长问题及整包约束，并保留字节硬上限。",
             "invisible": true
           },
           "request_byte_budget": {
             "type": "int",
-            "default": null,
+            "default": 192000,
             "description": "Jev 整包 UTF-8 字节硬上限（8000–524288）",
             "invisible": true
           }
@@ -579,115 +591,122 @@
         "items": {
           "admin_wake_names": {
             "type": "list",
-            "default": null,
+            "default": [],
             "description": "仅 AstrBot 管理员可用的短昵称",
             "invisible": true
           },
           "reply_to_bot_wakes": {
             "type": "bool",
-            "default": null,
+            "default": true,
             "description": "引用 Bot 时直接回应",
             "invisible": false,
             "hint": ""
           },
           "skip_reply_to_others": {
             "type": "bool",
-            "default": null,
+            "default": false,
             "description": "引用其他人时不主动接话",
             "invisible": true
           },
           "blocked_targets": {
             "type": "list",
-            "default": null,
+            "default": [],
             "description": "全阻塞名单：QQ、群号或 UMO",
             "invisible": true
           },
           "guard_exempt_targets": {
             "type": "list",
-            "default": null,
+            "default": [],
             "description": "过滤豁免名单：QQ、群号或 UMO",
             "hint": "豁免机器人、关键词、复读、前缀过滤与显式唤醒的沉默；不豁免全阻塞名单、主动回复配额、二审和安全发送检查。",
             "invisible": true
           },
           "block_official_qq_bots": {
             "type": "bool",
-            "default": null,
+            "default": true,
             "description": "过滤已知 QQ 官方机器人号码段",
             "hint": "仅号码规则；不根据说话风格或技术词汇推断身份。误判可加入豁免名单或关闭。",
             "invisible": true
           },
           "block_repeated_input": {
             "type": "bool",
-            "default": null,
+            "default": true,
             "description": "阻塞对最近已发送 Bot 回复的完整复读",
             "invisible": true
           },
           "blocked_keywords": {
             "type": "list",
-            "default": null,
+            "default": [],
             "description": "阻塞消息关键词（精确子串，可自行微调）",
             "invisible": true
           },
           "block_builtin_commands": {
             "type": "bool",
-            "default": null,
+            "default": false,
             "description": "阻塞下方指定命令",
             "invisible": true
           },
           "blocked_commands": {
             "type": "list",
-            "default": null,
+            "default": [],
             "description": "需要阻塞的命令名（不含前缀）",
             "invisible": true
           },
           "block_prefixed_commands": {
             "type": "bool",
-            "default": null,
+            "default": false,
             "description": "阻塞带框架唤醒前缀的已注册命令",
             "invisible": true
           },
           "block_prefixed_llm": {
             "type": "bool",
-            "default": null,
+            "default": false,
             "description": "阻塞带框架唤醒前缀的普通 LLM 请求",
             "invisible": true
           },
           "skip_command_prefixes": {
             "type": "list",
-            "default": null,
+            "default": [
+              "/",
+              "!"
+            ],
             "description": "这些前缀不作为自主接话话题（不拦正常命令）",
             "invisible": true
           },
           "respect_quiet_requests": {
             "type": "bool",
-            "default": null,
+            "default": true,
             "description": "听懂“别回复了”",
             "invisible": false,
             "hint": "被明确要求安静时，暂时停止接这个人的话。"
           },
           "quiet_request_seconds": {
             "type": "int",
-            "default": null,
+            "default": 300,
             "description": "个人安静请求有效秒数（1–3600）",
             "hint": "只针对请求者，新的明确呼叫可解除。此个人临时状态在重载/房间淘汰后清空；管理员 jev静音 的群状态持久化。",
             "invisible": true
           },
           "other_bot_ids": {
             "type": "list",
-            "default": null,
+            "default": [],
             "description": "其他 Bot 账号：只作背景，不主动接它们的话",
             "invisible": true
           },
           "strict_conflicts": {
             "type": "bool",
-            "default": null,
+            "default": true,
             "description": "检测到旧唤醒器时暂停本插件主动触发",
             "hint": "不会自动禁用或改写任何旧插件。影子模式可共存。使用 jev状态 查看。",
             "invisible": true
           },
           "proactive_tool_allowlist": {
             "type": "list",
-            "default": null,
+            "default": [
+              "keep_silent",
+              "context_aware_view_images",
+              "growth_memory_recall"
+            ],
             "description": "本插件自主接话时允许的工具",
             "hint": "默认只读感知与沉默，保留正常点名轮完整工具能力。按需添加经过核对的只读搜索/历史工具；不建议允许群管、发消息、付费生图或记忆写入。",
             "invisible": true
@@ -707,40 +726,40 @@
           },
           "timeout_seconds": {
             "type": "int",
-            "default": null,
+            "default": 8,
             "description": "判断超时（秒）",
             "invisible": false,
             "hint": "请求超时后放弃这次主动接话。"
           },
           "decision_queue_seconds": {
             "type": "float",
-            "default": null,
+            "default": 1,
             "description": "一审等待可用 Key 的上限（0–10秒）",
             "invisible": true
           },
           "review_queue_seconds": {
             "type": "float",
-            "default": null,
+            "default": 4,
             "description": "二审优先等待容量的上限（0–10秒）",
             "invisible": true
           },
           "retry_explicit_rejection": {
             "type": "bool",
-            "default": null,
+            "default": false,
             "description": "明确 401/403/429/529 拒绝时最多切换一次",
             "hint": "不重放超时、断连或模糊5xx；重发仍可能消耗额度。跨渠道还需开启渠道回退。",
             "invisible": true
           },
           "daily_evaluation_limit": {
             "type": "int",
-            "default": null,
+            "default": 0,
             "description": "每群每日候选评估尝试上限，0 不额外限制",
             "hint": "渠道日预算仍生效。影子观察单独计数，不用掉正式模式的群预算。",
             "invisible": true
           },
           "daily_reply_limit": {
             "type": "int",
-            "default": null,
+            "default": 0,
             "description": "每群每日自主发送上限，0 不额外限制",
             "invisible": true
           }
@@ -765,114 +784,10 @@
     "hint": "这些群仍保留昵称、@、引用 Bot 唤醒和过滤。完全排除请从 enabled_sessions 移除。",
     "invisible": true
   },
-  "admin_wake_names": {
-    "type": "list",
-    "default": [],
-    "description": "仅 AstrBot 管理员可用的短昵称",
-    "invisible": true
-  },
-  "direct_wake_interval": {
-    "type": "float",
-    "default": 0.5,
-    "description": "同人显式呼叫最低间隔秒数（0–10）",
-    "hint": "保留旧唤醒冷却能力；0 关闭，不替代自主回复的合并窗口。豁免名单不受限制。",
-    "invisible": true
-  },
-  "reply_to_bot_wakes": {
-    "type": "bool",
-    "default": true,
-    "description": "引用 Bot 消息直接唤醒",
-    "invisible": true
-  },
-  "skip_reply_to_others": {
-    "type": "bool",
-    "default": false,
-    "description": "引用其他人时不主动接话",
-    "invisible": true
-  },
-  "blocked_targets": {
-    "type": "list",
-    "default": [],
-    "description": "全阻塞名单：QQ、群号或 UMO",
-    "invisible": true
-  },
-  "guard_exempt_targets": {
-    "type": "list",
-    "default": [],
-    "description": "过滤豁免名单：QQ、群号或 UMO",
-    "hint": "豁免机器人、关键词、复读、前缀过滤与显式唤醒的沉默；不豁免全阻塞名单、主动回复配额、二审和安全发送检查。",
-    "invisible": true
-  },
-  "block_official_qq_bots": {
-    "type": "bool",
-    "default": true,
-    "description": "过滤已知 QQ 官方机器人号码段",
-    "hint": "仅号码规则；不根据说话风格或技术词汇推断身份。误判可加入豁免名单或关闭。",
-    "invisible": true
-  },
-  "block_repeated_input": {
-    "type": "bool",
-    "default": true,
-    "description": "阻塞对最近已发送 Bot 回复的完整复读",
-    "invisible": true
-  },
-  "blocked_keywords": {
-    "type": "list",
-    "default": [],
-    "description": "阻塞消息关键词（精确子串，可自行微调）",
-    "invisible": true
-  },
-  "block_builtin_commands": {
-    "type": "bool",
-    "default": false,
-    "description": "阻塞下方指定命令",
-    "invisible": true
-  },
-  "blocked_commands": {
-    "type": "list",
-    "default": [],
-    "description": "需要阻塞的命令名（不含前缀）",
-    "invisible": true
-  },
-  "block_prefixed_commands": {
-    "type": "bool",
-    "default": false,
-    "description": "阻塞带框架唤醒前缀的已注册命令",
-    "invisible": true
-  },
-  "block_prefixed_llm": {
-    "type": "bool",
-    "default": false,
-    "description": "阻塞带框架唤醒前缀的普通 LLM 请求",
-    "invisible": true
-  },
-  "skip_command_prefixes": {
-    "type": "list",
-    "default": [
-      "/",
-      "!"
-    ],
-    "description": "这些前缀不作为自主接话话题（不拦正常命令）",
-    "invisible": true
-  },
-  "respect_quiet_requests": {
-    "type": "bool",
-    "default": true,
-    "description": "尊重明确向 Bot 提出的短句安静请求",
-    "invisible": true
-  },
-  "quiet_request_seconds": {
+  "_product_config_version": {
     "type": "int",
-    "default": 300,
-    "description": "个人安静请求有效秒数（1–3600）",
-    "hint": "只针对请求者，新的明确呼叫可解除。此个人临时状态在重载/房间淘汰后清空；管理员 jev静音 的群状态持久化。",
-    "invisible": true
-  },
-  "interest_topics": {
-    "type": "list",
-    "default": [],
-    "description": "人设补充兴趣主题",
-    "hint": "仅作为语义判断背景，不是见词必回或随机唤醒。与人设冲突时以人设为准。",
+    "default": 0,
+    "description": "配置版本",
     "invisible": true
   },
   "allow_channel_fallback": {
@@ -880,305 +795,6 @@
     "default": false,
     "description": "首选池无容量时允许使用另一渠道",
     "hint": "只在请求发出前选择渠道；发出后失败不自动重发。官方可能收费。",
-    "invisible": true
-  },
-  "timeout_seconds": {
-    "type": "int",
-    "default": 8,
-    "description": "Jev 请求总超时秒数（1–30）",
-    "invisible": true
-  },
-  "second_review": {
-    "type": "string",
-    "default": "adaptive",
-    "options": [
-      "adaptive",
-      "off",
-      "selective",
-      "always"
-    ],
-    "description": "草稿复查：adaptive 仅场景变化时检查；always 每轮严格审查",
-    "hint": "推荐 adaptive：正常轮不再摘要或二审；新消息到达才检查回复是否过时。保留静默、撤回、重复、会话和发送许可检查。旧模式仍可选。",
-    "invisible": true
-  },
-  "persona_override": {
-    "type": "text",
-    "default": "",
-    "description": "判断人设覆盖（一般留空自动读取）",
-    "hint": "只影响 Jev 判断，不覆盖主模型人格；自动按 UMO 与 conversation 解析。",
-    "invisible": true
-  },
-  "read_life_schedule": {
-    "type": "bool",
-    "default": true,
-    "description": "读取已有生活日程，不生成新日程",
-    "invisible": true
-  },
-  "other_bot_ids": {
-    "type": "list",
-    "default": [],
-    "description": "其他 Bot 账号：只作背景，不主动接它们的话",
-    "invisible": true
-  },
-  "strict_conflicts": {
-    "type": "bool",
-    "default": true,
-    "description": "检测到旧唤醒器时暂停本插件主动触发",
-    "hint": "不会自动禁用或改写任何旧插件。影子模式可共存。使用 jev状态 查看。",
-    "invisible": true
-  },
-  "debounce_seconds": {
-    "type": "float",
-    "default": 0,
-    "description": "首次判断前额外等待秒数（0–5）",
-    "hint": "默认不固定等待。连续补充由下方窗口监听；这不是合并窗口。",
-    "invisible": true
-  },
-  "burst_merge_enabled": {
-    "type": "bool",
-    "default": true,
-    "description": "同人连续补充合并：先判断生成，未输出时替换旧轮",
-    "hint": "按群/会话/发送者独立管理，别人插话不混串。已发送或正在投递不合并重放；仅原生自主候选参与。",
-    "invisible": true
-  },
-  "burst_max_messages": {
-    "type": "int",
-    "default": 8,
-    "description": "一次连续补充最多合并几条（2–12）",
-    "invisible": true
-  },
-  "candidate_wait_seconds": {
-    "type": "int",
-    "default": 15,
-    "description": "最新候选等待当前自主轮收尾的上限（1–30秒）",
-    "invisible": true
-  },
-  "continuation_min_interval": {
-    "type": "float",
-    "default": 1,
-    "description": "同人续聊最低间隔秒数（不作为自动回复许可）",
-    "invisible": true
-  },
-  "request_lifetime_seconds": {
-    "type": "int",
-    "default": 90,
-    "description": "自主请求最长生命周期秒数（15–180）",
-    "invisible": true
-  },
-  "evaluation_interval": {
-    "type": "int",
-    "default": 4,
-    "description": "同群 Jev 评估最小间隔秒数",
-    "invisible": true
-  },
-  "min_reply_interval": {
-    "type": "int",
-    "default": 8,
-    "description": "自主回复最小间隔秒数，不影响正常点名",
-    "invisible": true
-  },
-  "continuation_seconds": {
-    "type": "int",
-    "default": 180,
-    "description": "续聊参考窗口秒数；仍需语义相关，不等于自动回",
-    "invisible": true
-  },
-  "daily_evaluation_limit": {
-    "type": "int",
-    "default": 0,
-    "description": "每群每日候选评估尝试上限，0 不额外限制",
-    "hint": "渠道日预算仍生效。影子观察单独计数，不用掉正式模式的群预算。",
-    "invisible": true
-  },
-  "daily_reply_limit": {
-    "type": "int",
-    "default": 0,
-    "description": "每群每日自主发送上限，0 不额外限制",
-    "invisible": true
-  },
-  "context_mode": {
-    "type": "string",
-    "default": "quality",
-    "options": [
-      "quality",
-      "balanced",
-      "economy"
-    ],
-    "description": "上下文：效果优先 / 均衡 / 节省",
-    "hint": "默认预算内保留所选窗口原文与完整人设，不做固定单条截短。仅超安全预算才移除完整旧消息；核心内容过大则诊断并暂停，不暗中截断人设。",
-    "invisible": true
-  },
-  "context_message_limit": {
-    "type": "int",
-    "default": 40,
-    "description": "相关对话窗口最多消息数（4–100）",
-    "invisible": true
-  },
-  "overflow_evidence_policy": {
-    "type": "string",
-    "default": "summarize",
-    "options": [
-      "summarize",
-      "reject"
-    ],
-    "description": "二审辅助证据确实超预算时的处理",
-    "hint": "summarize 仅在超限时使用当前主模型整理辅助记忆/场景，保留人设与目标原文，并标记为有损摘要；增加一次主模型调用，不改生成模型原始上下文。reject 则暂停该轮。",
-    "invisible": true
-  },
-  "overflow_summary_timeout": {
-    "type": "int",
-    "default": 20,
-    "description": "超预算辅助证据整理超时秒数（5–30）",
-    "invisible": true
-  },
-  "protected_recent_messages": {
-    "type": "int",
-    "default": 4,
-    "description": "预算不足时保护的最近消息数（1–8）",
-    "invisible": true
-  },
-  "context_safety_margin": {
-    "type": "float",
-    "default": 0.15,
-    "description": "估算 token 安全余量（0.05–0.4）",
-    "hint": "不是供应商精确 tokenizer；同时检查 state+最长问题及整包约束，并保留字节硬上限。",
-    "invisible": true
-  },
-  "request_byte_budget": {
-    "type": "int",
-    "default": 192000,
-    "description": "Jev 整包 UTF-8 字节硬上限（8000–524288）",
-    "invisible": true
-  },
-  "question_overrides": {
-    "type": "text",
-    "default": "",
-    "description": "高级：判断问题措辞/标准覆盖 JSON",
-    "hint": "可覆盖 reply_now、still_fits 或旧版六项判断，通常留空。不改变 noul 类型。",
-    "invisible": true
-  },
-  "image_decision_mode": {
-    "type": "string",
-    "default": "text_gate",
-    "options": [
-      "native_vision",
-      "text_gate"
-    ],
-    "description": "图片：text_gate 先看语境再决定读图；native_vision 每次交主模型看图",
-    "hint": "推荐 text_gate。Jev 只根据文字、发图者和上下文筛选，不识别像素。通过后主模型读取原图；明确@不受此筛选影响。纯图片缺少语境时可能漏掉有趣的图，可按需选 native_vision，代价是更多主模型调用。",
-    "invisible": true
-  },
-  "uncertain_adjudication": {
-    "type": "bool",
-    "default": true,
-    "description": "边界候选交给拥有完整记忆的主模型再判断",
-    "invisible": true
-  },
-  "decision_queue_seconds": {
-    "type": "float",
-    "default": 1,
-    "description": "一审等待可用 Key 的上限（0–10秒）",
-    "invisible": true
-  },
-  "review_queue_seconds": {
-    "type": "float",
-    "default": 4,
-    "description": "二审优先等待容量的上限（0–10秒）",
-    "invisible": true
-  },
-  "retry_explicit_rejection": {
-    "type": "bool",
-    "default": false,
-    "description": "明确 401/403/429/529 拒绝时最多切换一次",
-    "hint": "不重放超时、断连或模糊5xx；重发仍可能消耗额度。跨渠道还需开启渠道回退。",
-    "invisible": true
-  },
-  "address_threshold": {
-    "type": "float",
-    "default": 0.8,
-    "description": "间接对 Bot 说话的门槛（0–1）",
-    "invisible": true
-  },
-  "continuation_threshold": {
-    "type": "float",
-    "default": 0.7,
-    "description": "自然续聊门槛（0–1）",
-    "invisible": true
-  },
-  "response_value_threshold": {
-    "type": "float",
-    "default": 0.5,
-    "description": "接话最低价值/自然反应分（0–1）",
-    "invisible": true
-  },
-  "intrusion_threshold": {
-    "type": "float",
-    "default": 0.45,
-    "description": "打扰分达到此值则沉默（0–1）",
-    "invisible": true
-  },
-  "join_threshold_offset": {
-    "type": "float",
-    "default": 0,
-    "description": "主动加入话题的门槛偏移，正值更克制",
-    "invisible": true
-  },
-  "join_intrusion_ceiling": {
-    "type": "float",
-    "default": 0.2,
-    "description": "主动加入时允许的最高打扰分（0–1）",
-    "invisible": true
-  },
-  "review_appropriate_threshold": {
-    "type": "float",
-    "default": 0.75,
-    "description": "二审合适程度最低分（0–1）",
-    "invisible": true
-  },
-  "review_redundancy_ceiling": {
-    "type": "float",
-    "default": 0.35,
-    "description": "二审重复程度最高分（0–1）",
-    "invisible": true
-  },
-  "max_autonomous_reply_chars": {
-    "type": "int",
-    "default": 2000,
-    "description": "自主回复最长字符数，超出则沉默（200–20000）",
-    "invisible": true
-  },
-  "proactive_tool_allowlist": {
-    "type": "list",
-    "default": [
-      "keep_silent",
-      "context_aware_view_images",
-      "growth_memory_recall"
-    ],
-    "description": "本插件自主接话时允许的工具",
-    "hint": "默认只读感知与沉默，保留正常点名轮完整工具能力。按需添加经过核对的只读搜索/历史工具；不建议允许群管、发消息、付费生图或记忆写入。",
-    "invisible": true
-  },
-  "decision_mode": {
-    "type": "string",
-    "default": "natural",
-    "options": [
-      "natural",
-      "classic"
-    ],
-    "description": "判断方式：natural 直接判断是否自然接话；classic 使用旧版四项阈值",
-    "invisible": true
-  },
-  "natural_reply_threshold": {
-    "type": "float",
-    "default": 0.5,
-    "description": "自然判断基础门槛（通常无需修改）",
-    "hint": "活跃程度在此基础上调整。不是经校准的正确率。",
-    "invisible": true
-  },
-  "_product_config_version": {
-    "type": "int",
-    "default": 0,
-    "description": "配置版本",
     "invisible": true
   }
 }

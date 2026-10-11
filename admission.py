@@ -7,6 +7,127 @@ def normalize(text):
     return re.sub(r"[^\w\u4e00-\u9fff]", "", str(text).lower())
 
 
+def topic_terms(text):
+    text = str(text or "")[:4096].lower()
+    terms = set(re.findall(r"[a-z][a-z0-9_]+", text))
+    for run in re.findall(r"[\u4e00-\u9fff]+", text):
+        terms.update(run[i : i + 2] for i in range(len(run) - 1))
+    return terms - {
+        "这个",
+        "那个",
+        "我们",
+        "你们",
+        "今天",
+        "现在",
+        "可以",
+        "一下",
+        "怎么",
+        "什么",
+        "问题",
+        "时候",
+        "还是",
+        "就是",
+        "the",
+        "and",
+        "this",
+        "that",
+        "with",
+        "have",
+        "what",
+        "when",
+        "you",
+        "are",
+        "for",
+        "can",
+        "how",
+        "today",
+    }
+
+
+def related_topic(left, right):
+    a, b = topic_terms(left), topic_terms(right)
+    return bool(a & b)
+
+
+def explicit_wake(event, config):
+    if getattr(event, "is_at_or_wake_command", False):
+        return True
+    parts = event.get_messages()
+    bot = str(event.get_self_id())
+    if any(
+        type(p).__name__ == "At" and str(getattr(p, "qq", "")) == bot for p in parts
+    ):
+        return True
+    if any(
+        type(p).__name__ == "Reply" and str(getattr(p, "sender_id", "")) == bot
+        for p in parts
+    ):
+        return True
+    plain = str(event.get_message_str() or "")
+    names = [
+        str(n).strip()
+        for n in [*config.get("wake_names", []), *config.get("admin_wake_names", [])]
+        if str(n).strip()
+    ]
+    return any(name in plain for name in names)
+
+
+def local_prefilter(event, config, recent_text="", recent_at=0.0, now=0.0):
+    """Filter content-free interjections and repeated declined topics, not photos."""
+    if not config.get("local_prefilter_enabled", True) or explicit_wake(event, config):
+        return None
+    parts = event.get_messages()
+    # Platform image sub_type=1 is a sticker; ordinary images still use text_gate.
+    stickers = {"Face", "Emoji", "Sticker", "MFace"}
+    substantive = any(
+        type(p).__name__ in ("Record", "Video", "File")
+        or (type(p).__name__ == "Image" and str(getattr(p, "sub_type", "0")) != "1")
+        for p in parts
+    )
+    if substantive:
+        return None
+    plain = str(
+        event.get_extra("_gemini_stt_transcript") or event.get_message_str() or ""
+    ).strip()
+    text = re.sub(r"[\s，。！!？?,.]+", "", plain.lower())
+    if (
+        plain
+        and len(plain) <= 16
+        and (not text or re.fullmatch(r"(?:哈|呵|嘿|嗯|哦|额|啊|6)+|ok|好的", text))
+    ):
+        return "local_prefilter_low_information"
+    if any(
+        type(p).__name__ in stickers
+        or (type(p).__name__ == "Image" and str(getattr(p, "sub_type", "0")) == "1")
+        for p in parts
+    ) and not any(
+        type(p).__name__ == "Plain" and str(getattr(p, "text", "")).strip()
+        for p in parts
+    ):
+        return "local_prefilter_sticker"
+    if plain and all(
+        c.isspace()
+        or c in "\u200d\ufe0f\u20e3©®™"
+        or ("\u20e3" in plain and c in "0123456789#*")
+        or 0x1F000 <= ord(c) <= 0x1FAFF
+        or 0x2600 <= ord(c) <= 0x27BF
+        for c in plain
+    ):
+        return "local_prefilter_emoji"
+    cooldown = max(0.0, min(300.0, float(config.get("prefilter_cooldown_seconds", 20))))
+    if len(plain) > 4096:
+        return None
+    a, b = topic_terms(plain), topic_terms(recent_text)
+    similar = bool(a and b and len(a & b) / max(len(a), len(b)) >= 0.8)
+    if (
+        recent_text
+        and 0 <= now - recent_at < cooldown
+        and (normalize(plain) == normalize(recent_text) or similar)
+    ):
+        return "local_prefilter_recent_topic"
+    return None
+
+
 def guard_exempt(event, config):
     targets = {
         str(event.get_sender_id()),

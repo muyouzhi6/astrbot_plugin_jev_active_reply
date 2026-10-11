@@ -81,6 +81,33 @@ def test_legacy_migration_removes_caps_and_preserves_conversation_settings():
     assert raw == once
 
 
+def test_patch_removes_only_legacy_duplicates_and_preserves_effective_values():
+    config_path = Path(
+        "/workspace/tasks/20261011-jev-optimize/live/config.redacted.json"
+    )
+    patch_path = Path("/workspace/tasks/20261011-jev-optimize/out/config-patch.json")
+    source = json.loads(config_path.read_text(encoding="utf-8-sig"))
+    patch = json.loads(patch_path.read_text(encoding="utf-8"))
+    patched = deepcopy(source)
+    for key in patch["delete_top_level"]:
+        patched.pop(key, None)
+    for path, value in patch["set"].items():
+        current = patched
+        segments = path.split(".")
+        for segment in segments[:-1]:
+            current = current.setdefault(segment, {})
+        current[segments[-1]] = value
+    namespace = {}
+    exec((config_path.parent / "plugin" / "settings.py").read_text(), namespace)
+    before, after = namespace["ConfigView"](deepcopy(source)), ConfigView(patched)
+    excluded = {"advanced", "interest_topics"}
+    first = {k: before[k] for k in before if k not in excluded}
+    second = {k: after[k] for k in after if k not in excluded}
+    assert first == second
+    assert set(patch["set"]) == {"advanced.context.interest_topics"}
+    assert before["interest_topics"] != after["interest_topics"]
+
+
 def test_inactive_channel_bad_configuration_cannot_break_selected_channel():
     config = ConfigView(
         {

@@ -1,10 +1,11 @@
-"""Bounded runtime state and durable counters; no chat or key persistence."""
+"""Runtime state, daily aggregates and bounded audit details."""
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import json
+import re
 import sqlite3
 import time
 import threading
@@ -13,6 +14,19 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from .burst import BurstBook
+
+
+def audit_preview(text):
+    text = str(text or "")
+    text = re.sub(r"(?i)(?:sk-|apikey_)[A-Za-z0-9_-]+", "[redacted]", text)
+    text = re.sub(r"(?i)cookie\s*[:= ]+[^\n]+", "[redacted]", text)
+    text = re.sub(
+        r"(?i)(?:authorization|api[_-]?key|\bkey|token|password)\s*[:= ]+(?:bearer\s+)?[^\s,，;；]+",
+        "[redacted]",
+        text,
+    )
+    text = re.sub(r"(?i)bearer\s+[^\s,，;；]+", "[redacted]", text)
+    return text[:50]
 
 
 def scope_id(umo: str) -> str:
@@ -42,6 +56,8 @@ class Room:
     quiet_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     quiet_senders: dict = field(default_factory=dict)
     direct_wakes: dict = field(default_factory=dict)
+    last_judged_text: str = ""
+    last_judged_at: float = 0
 
     def notify(self):
         signal, self.changed = self.changed, asyncio.Event()
@@ -55,6 +71,8 @@ class Room:
         if message_id in self.seen:
             return False
         self.seen.append(message_id)
+        row = dict(row)
+        row["generation"] = self.generation + 1
         self.rows.append(row)
         # Bound stored text by bytes, not destructive per-message previews.
         while (
@@ -116,7 +134,21 @@ class Ledger:
         CREATE TABLE IF NOT EXISTS counts(day TEXT, scope TEXT, kind TEXT, n INTEGER, PRIMARY KEY(day,scope,kind));
         CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY, ts REAL, scope TEXT, reason TEXT, details TEXT);
         CREATE TABLE IF NOT EXISTS cooldowns(scope TEXT PRIMARY KEY, until REAL);
+        CREATE TABLE IF NOT EXISTS daily_summary(
+            day TEXT NOT NULL, scope TEXT NOT NULL, reason TEXT NOT NULL,
+            n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(day,scope,reason)
+        );
+        CREATE TABLE IF NOT EXISTS jev_migrations(version INTEGER PRIMARY KEY);
         """)
+        with self.db:
+            if not self.db.execute(
+                "SELECT 1 FROM jev_migrations WHERE version=1"
+            ).fetchone():
+                for ts, scope, reason in self.db.execute(
+                    "SELECT ts,scope,reason FROM audit"
+                ).fetchall():
+                    self._summarize(ts, scope, reason)
+                self.db.execute("INSERT INTO jev_migrations VALUES(1)")
         self.db.commit()
 
     @staticmethod
@@ -139,7 +171,7 @@ class Ledger:
             )
 
     def record(self, umo, reason, details=None):
-        # Explicit allowlist, never persist upstream bodies or chat content.
+        # Explicit allowlist; preview is the sole bounded message-content field.
         allowed = {
             k: v
             for k, v in (details or {}).items()
@@ -155,13 +187,17 @@ class Ledger:
                 "turn_id",
                 "elapsed_ms",
                 "stage_ms",
+                "trigger_preview",
             )
         }
+        if "trigger_preview" in allowed:
+            allowed["trigger_preview"] = audit_preview(allowed["trigger_preview"])
+        stamp = time.time()
         with self.lock, self.db:
             self.db.execute(
                 "INSERT INTO audit(ts,scope,reason,details) VALUES(?,?,?,?)",
                 (
-                    time.time(),
+                    stamp,
                     scope_id(umo),
                     reason,
                     json.dumps(allowed, ensure_ascii=False),
@@ -173,6 +209,17 @@ class Ledger:
             self.db.execute(
                 "DELETE FROM counts WHERE day < date(?, '-30 days')", (self.day(),)
             )
+            self._summarize(stamp, scope_id(umo), reason)
+
+    def _summarize(self, stamp, scope, reason):
+        day = (
+            datetime.fromtimestamp(stamp, ZoneInfo("Asia/Shanghai")).date().isoformat()
+        )
+        self.db.execute(
+            "INSERT INTO daily_summary(day,scope,reason,n) VALUES(?,?,?,1) "
+            "ON CONFLICT(day,scope,reason) DO UPDATE SET n=n+1",
+            (day, scope, reason),
+        )
 
     def recent(self, umo):
         with self.lock:

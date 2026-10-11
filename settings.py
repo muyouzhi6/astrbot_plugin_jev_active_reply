@@ -2,6 +2,11 @@
 
 from collections.abc import MutableMapping
 from copy import deepcopy
+import json
+import os
+from pathlib import Path
+from datetime import datetime
+import tempfile
 
 
 GROUPS = {
@@ -33,6 +38,8 @@ GROUPS = {
         "min_reply_interval",
         "continuation_seconds",
         "direct_wake_interval",
+        "local_prefilter_enabled",
+        "prefilter_cooldown_seconds",
     ),
     "context": (
         "persona_override",
@@ -79,6 +86,51 @@ GROUPS = {
 KEY_GROUP = {key: group for group, keys in GROUPS.items() for key in keys}
 
 
+# Channel fallback is deliberately outside the 0.9.0 migration.
+MIGRATED_KEYS = set(KEY_GROUP) - {"allow_channel_fallback"}
+
+
+def migrate_groups(raw):
+    changed = False
+    advanced = raw.setdefault("advanced", {})
+    for key in MIGRATED_KEYS:
+        section = advanced.setdefault(KEY_GROUP[key], {})
+        if key in raw:
+            if section.get(key) is None:
+                section[key] = deepcopy(raw[key])
+            del raw[key]
+            changed = True
+    return changed
+
+
+def migrate_config_file(path):
+    """Run before AstrBotConfig removes keys absent from the new schema."""
+    path = Path(path)
+    if not path.is_file():
+        return
+    original = path.read_bytes()
+    raw = json.loads(original.decode("utf-8-sig"))
+    if not migrate_groups(raw):
+        return
+    backup = path.with_name(
+        path.name + datetime.now().strftime(".%Y%m%d-%H%M%S-%f.bak")
+    )
+    with os.fdopen(
+        os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb"
+    ) as handle:
+        handle.write(original)
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=".jev-migrate-")
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(raw, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 class ConfigView(MutableMapping):
     """Keep one effective value; null grouped entries inherit legacy values once."""
 
@@ -123,6 +175,7 @@ class ConfigView(MutableMapping):
                     )
             raw["_product_config_version"] = 1
             changed = True
+        changed = migrate_groups(raw) or changed
         if changed:
             save = getattr(raw, "save_config", None)
             if callable(save):
@@ -134,6 +187,8 @@ class ConfigView(MutableMapping):
             section = self.raw.get("advanced", {}).get(group, {})
             if section.get(key) is not None:
                 return section[key]
+            if key in MIGRATED_KEYS:
+                raise KeyError(key)
         return self.raw[key]
 
     def __setitem__(self, key, value):
@@ -147,6 +202,8 @@ class ConfigView(MutableMapping):
         group = KEY_GROUP.get(key)
         if group:
             self.raw.get("advanced", {}).get(group, {}).pop(key, None)
+        if key in MIGRATED_KEYS:
+            return
         del self.raw[key]
 
     def __iter__(self):

@@ -5,6 +5,7 @@ from pathlib import Path
 
 from ..policy import decide, pack_state
 from ..state import Ledger, Room, RoomBook
+from ..admission import local_prefilter
 
 
 class PolicyTests(unittest.TestCase):
@@ -102,3 +103,54 @@ class PolicyTests(unittest.TestCase):
             self.assertNotIn("private chat", path.read_bytes().decode(errors="ignore"))
             self.assertNotIn("SECRET", path.read_bytes().decode(errors="ignore"))
             ledger.close()
+
+    def test_daily_summary_migrates_and_retains_long_term_stats(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "audit.sqlite3"
+            ledger = Ledger(path)
+            ledger.record("room", "natural_silence", {"elapsed_ms": 100})
+            ledger.record("room", "adapter_send_completed", {"elapsed_ms": 200})
+            table = ledger.db.execute(
+                "SELECT reason,n FROM daily_summary ORDER BY reason"
+            ).fetchall()
+            self.assertEqual(
+                table, [("adapter_send_completed", 1), ("natural_silence", 1)]
+            )
+            ledger.close()
+
+    def test_local_prefilter_keeps_explicit_wakes(self):
+        class Part:
+            def __init__(self, name, **attrs):
+                self.__class__ = type(name, (), {})
+                self.__dict__.update(attrs)
+
+        class Event:
+            def __init__(self, text, parts):
+                self.text, self.parts = text, parts
+
+            def get_messages(self):
+                return self.parts
+
+            def get_message_str(self):
+                return self.text
+
+            def get_self_id(self):
+                return "bot"
+
+            def get_extra(self, key):
+                return None
+
+        cfg = {"local_prefilter_enabled": True, "wake_names": ["吱吱"]}
+        self.assertEqual(
+            local_prefilter(Event("哈哈", [Part("Plain")]), cfg),
+            "local_prefilter_low_information",
+        )
+        self.assertIsNone(local_prefilter(Event("吱吱 哈哈", [Part("Plain")]), cfg))
+        self.assertEqual(
+            local_prefilter(Event("🙂🙂", [Part("Plain")]), cfg),
+            "local_prefilter_emoji",
+        )
+        self.assertEqual(
+            local_prefilter(Event("话题", [Part("Plain")]), cfg, "话题", 90, 100),
+            "local_prefilter_recent_topic",
+        )

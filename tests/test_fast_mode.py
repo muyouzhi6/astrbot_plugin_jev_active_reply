@@ -13,7 +13,7 @@ from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 from ..client import KeyPool
 from ..main import MARK
 from ..policy import natural_decide, questions_for
-from ..settings import ConfigView, GROUPS
+from ..settings import ConfigView, GROUPS, migrate_config_file
 from . import test_integration as base
 from . import test_v020 as previous
 
@@ -198,6 +198,7 @@ def test_real_core_schema_roundtrip_preserves_old_values_and_new_ui_edits(tmp_pa
         "style": "quiet",
     }
     path.write_text(json.dumps(old), encoding="utf-8")
+    migrate_config_file(path)
     raw = AstrBotConfig(str(path), schema=schema)
     config = ConfigView(raw)
     for key in ("second_review", "evaluation_interval", "style", "blocked_keywords"):

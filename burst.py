@@ -110,4 +110,9 @@ def transfer_attachments(old, new, parts):
     for path in tracked:
         if str(Path(path).resolve(strict=False)) in paths:
             new.track_temporary_local_file(path)
-            old.untrack_temporary_local_file(path)
+            untrack = getattr(old, "untrack_temporary_local_file", None)
+            if callable(untrack):
+                untrack(path)
+            else:
+                # AstrBot 4.26.8 tracks these paths in a list, without an untrack API.
+                old._temporary_local_files.remove(path)

@@ -222,7 +222,7 @@ async def test_native_request_collects_merged_text_and_two_images(
         "_get_session_conv",
         AsyncMock(return_value=NS(cid=env.cid, history="[]")),
     )
-    req, _ = await astr_main_agent.collect_initial_request(
+    req, _ = await base.collect_request(
         two,
         env.ctx,
         astr_main_agent.MainAgentBuildConfig(

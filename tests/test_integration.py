@@ -33,6 +33,29 @@ def event(mid="1", text="这个我也遇到了", sender="human", group="group", 
     )
 
 
+async def collect_request(event, context, config):
+    """Exercise the native collector on both supported Core versions."""
+    from astrbot.core import astr_main_agent
+
+    if hasattr(astr_main_agent, "collect_initial_request"):
+        return await astr_main_agent.collect_initial_request(event, context, config)
+
+    class Collected(Exception):
+        pass
+
+    async def capture(event, request, *args, **kwargs):
+        raise Collected(request)
+
+    with patch.object(astr_main_agent, "_decorate_llm_request", capture):
+        try:
+            await astr_main_agent.build_main_agent(
+                event=event, plugin_context=context, config=config, provider=object()
+            )
+        except Collected as result:
+            return result.args[0], None
+    raise AssertionError("Native collector did not produce a request")
+
+
 class IntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -75,6 +98,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             "enabled_sessions": ["*"],
             "dry_run": False,
             "debounce_seconds": 0,
+            "evaluation_interval": 4,
             "strict_conflicts": True,
             "second_review": "off",
             "image_decision_mode": "native_vision",
@@ -86,6 +110,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             return_value=Path(self.tmp.name),
         ):
             self.plugin = JevActiveReply(self.ctx, self.cfg)
+        self.cfg = self.plugin.config
         self.response = {
             "values": dict(
                 addressed=0.85, continuation=0.7, worthwhile=0.9, intrusive=0.1
@@ -371,7 +396,6 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_native_collector_keeps_image_and_conversation(self):
         from astrbot.core.astr_main_agent import (
-            collect_initial_request,
             MainAgentBuildConfig,
         )
 
@@ -380,7 +404,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(
             Image, "convert_to_file_path", AsyncMock(return_value="/test/unchanged.png")
         ):
-            request, _ = await collect_initial_request(
+            request, _ = await collect_request(
                 ev,
                 self.ctx,
                 MainAgentBuildConfig(tool_call_timeout=30, provider_settings={}),
