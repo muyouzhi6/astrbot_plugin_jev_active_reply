@@ -1,0 +1,21 @@
+{
+  "delete_top_level": [
+    "timeout_seconds",
+    "second_review",
+    "image_decision_mode",
+    "context_message_limit",
+    "natural_reply_threshold",
+    "reply_to_bot_wakes",
+    "min_reply_interval"
+  ],
+  "set": {
+    "advanced.context.interest_topics": [
+      "变量 函数 循环 调试 注释 算法",
+      "浪漫 约会 陪伴 爱意 亲密 关怀",
+      "木有知 吱吱 木吱吱",
+      "RVC 变声器 RVC模型训练 实时语音转换",
+      "医生 医学生 学医的 皮肤",
+      "AstrBot插件开发 AstrBot插件商店 aiocqhttp适配 插件报错复现 插件回归测试 软路由配置 代理连接排障"
+    ]
+  }
+}

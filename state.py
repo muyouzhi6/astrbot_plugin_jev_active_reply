@@ -19,9 +19,10 @@ from .burst import BurstBook
 def audit_preview(text):
     text = str(text or "")
     text = re.sub(r"(?i)(?:sk-|apikey_)[A-Za-z0-9_-]+", "[redacted]", text)
-    text = re.sub(r"(?i)cookie\s*[:= ]+[^\n]+", "[redacted]", text)
+    # Discard the tail at a credential field: quoted/multiline/structured values
+    # must not leave fragments in the preview, even when the input is not JSON.
     text = re.sub(
-        r"(?i)(?:authorization|api[_-]?key|\bkey|token|password)\s*[:= ]+(?:bearer\s+)?[^\s,，;；]+",
+        r"""(?is)["']?(?:authorization|api[_-]?key|\bkey|token|password|cookie)["']?\s*[:= ]+.*""",
         "[redacted]",
         text,
     )

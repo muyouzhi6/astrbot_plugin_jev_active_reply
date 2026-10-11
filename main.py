@@ -20,7 +20,14 @@ from astrbot.core.agent.message import TextPart
 from astrbot.core.star.star_tools import StarTools
 
 from . import bridge, silence, burst
-from .admission import guard_exempt, input_decision, local_prefilter, related_topic
+from .admission import (
+    awaiting_image,
+    correction,
+    guard_exempt,
+    input_decision,
+    local_prefilter,
+    related_topic,
+)
 from .client import DecisionError, JevClient
 from .delivery import DeliveryDeclined, EventBotProxy, SplitAdapters
 from .policy import (
@@ -385,6 +392,11 @@ class JevActiveReply(Star):
             content = str(row.get("content", ""))
             if related_topic(text, content):
                 return True
+            if row.get("sender_id") == target.get("sender_id") and (
+                correction(content)
+                or (row.get("has_image") and awaiting_image(target.get("content", "")))
+            ):
+                return True
             if row.get("sender_id") == target.get("sender_id") and content.startswith(
                 (
                     "不对",
@@ -554,6 +566,19 @@ class JevActiveReply(Star):
             and not previous.sending
             and (
                 related_topic(" ".join(previous.texts), text)
+                or correction(text)
+                or (
+                    not text.strip()
+                    and any(type(p).__name__ == "Image" for p in parts)
+                    and (
+                        awaiting_image(" ".join(previous.texts))
+                        or any(
+                            type(p).__name__ == "Reply"
+                            and str(getattr(p, "id", "")) in previous.ids
+                            for p in parts
+                        )
+                    )
+                )
                 or text.startswith(
                     (
                         "还有",

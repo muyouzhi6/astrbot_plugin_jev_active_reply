@@ -1,0 +1,74 @@
+{
+  "source": {
+    "_product_config_version": 1,
+    "primary_channel": "nanbei",
+    "nanbei": {
+      "keys": []
+    },
+    "typesafe": {
+      "keys": []
+    },
+    "style": "quiet",
+    "enabled_sessions": [
+      "fixture-group"
+    ],
+    "behavior_guidance": "fixture persona",
+    "burst_window_seconds": 15,
+    "timeout_seconds": 8,
+    "second_review": "always",
+    "image_decision_mode": "native_vision",
+    "context_message_limit": 40,
+    "natural_reply_threshold": 0.5,
+    "reply_to_bot_wakes": true,
+    "min_reply_interval": 8,
+    "advanced": {
+      "network": {
+        "timeout_seconds": 10
+      },
+      "judgment": {
+        "second_review": "adaptive",
+        "image_decision_mode": "text_gate",
+        "natural_reply_threshold": 0.6
+      },
+      "context": {
+        "context_message_limit": 20,
+        "interest_topics": [
+          "ai AI",
+          "测试",
+          "地址"
+        ]
+      },
+      "guards": {
+        "reply_to_bot_wakes": false
+      },
+      "timing": {
+        "min_reply_interval": 12,
+        "evaluation_interval": 6
+      }
+    }
+  },
+  "effective": {
+    "_product_config_version": 1,
+    "primary_channel": "nanbei",
+    "nanbei": {
+      "keys": []
+    },
+    "typesafe": {
+      "keys": []
+    },
+    "style": "quiet",
+    "enabled_sessions": [
+      "fixture-group"
+    ],
+    "behavior_guidance": "fixture persona",
+    "burst_window_seconds": 15,
+    "timeout_seconds": 10,
+    "second_review": "adaptive",
+    "image_decision_mode": "text_gate",
+    "context_message_limit": 20,
+    "natural_reply_threshold": 0.6,
+    "reply_to_bot_wakes": false,
+    "min_reply_interval": 12,
+    "evaluation_interval": 6
+  }
+}

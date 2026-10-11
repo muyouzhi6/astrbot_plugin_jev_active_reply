@@ -49,6 +49,45 @@ def related_topic(left, right):
     return bool(a & b)
 
 
+def correction(text):
+    return str(text).lstrip().startswith(("改成", "改为", "换成", "说错了"))
+
+
+def awaiting_image(text):
+    return bool(
+        re.search(
+            r"(?:看|检查|分析|识别|读|下面|这张|附|发).{0,24}(?:截图|图片|照片|图)"
+            r"|(?:截图|图片|照片).{0,24}(?:如下|在下面|发给你)",
+            str(text),
+        )
+    )
+
+
+def _sticker_image_ids(event, parts):
+    images = [p for p in parts if type(p).__name__ == "Image"]
+    marked = {id(p) for p in images if str(getattr(p, "sub_type", "0")) == "1"}
+    if not images:
+        return marked
+    # AstrBot's OneBot Image model drops sub_type; the original event retains it.
+    raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+    segments = raw.get("message") if isinstance(raw, dict) else None
+    if not isinstance(segments, list):
+        return marked
+    originals = [
+        p.get("data", {})
+        for p in segments
+        if isinstance(p, dict) and p.get("type") == "image"
+    ]
+    # A different image count means the original segments no longer align.
+    if len(originals) == len(images):
+        marked.update(
+            id(image)
+            for image, data in zip(images, originals)
+            if isinstance(data, dict) and str(data.get("sub_type", "0")) == "1"
+        )
+    return marked
+
+
 def explicit_wake(event, config):
     if getattr(event, "is_at_or_wake_command", False):
         return True
@@ -79,9 +118,10 @@ def local_prefilter(event, config, recent_text="", recent_at=0.0, now=0.0):
     parts = event.get_messages()
     # Platform image sub_type=1 is a sticker; ordinary images still use text_gate.
     stickers = {"Face", "Emoji", "Sticker", "MFace"}
+    sticker_images = _sticker_image_ids(event, parts)
     substantive = any(
         type(p).__name__ in ("Record", "Video", "File")
-        or (type(p).__name__ == "Image" and str(getattr(p, "sub_type", "0")) != "1")
+        or (type(p).__name__ == "Image" and id(p) not in sticker_images)
         for p in parts
     )
     if substantive:
@@ -97,9 +137,7 @@ def local_prefilter(event, config, recent_text="", recent_at=0.0, now=0.0):
     ):
         return "local_prefilter_low_information"
     if any(
-        type(p).__name__ in stickers
-        or (type(p).__name__ == "Image" and str(getattr(p, "sub_type", "0")) == "1")
-        for p in parts
+        type(p).__name__ in stickers or id(p) in sticker_images for p in parts
     ) and not any(
         type(p).__name__ == "Plain" and str(getattr(p, "text", "")).strip()
         for p in parts

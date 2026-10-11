@@ -82,12 +82,10 @@ def test_legacy_migration_removes_caps_and_preserves_conversation_settings():
 
 
 def test_patch_removes_only_legacy_duplicates_and_preserves_effective_values():
-    config_path = Path(
-        "/workspace/tasks/20261011-jev-optimize/live/config.redacted.json"
-    )
-    patch_path = Path("/workspace/tasks/20261011-jev-optimize/out/config-patch.json")
-    source = json.loads(config_path.read_text(encoding="utf-8-sig"))
-    patch = json.loads(patch_path.read_text(encoding="utf-8"))
+    fixtures = Path(__file__).parent / "fixtures"
+    fixture = json.loads((fixtures / "legacy-config.json").read_text(encoding="utf-8"))
+    source = fixture["source"]
+    patch = json.loads((fixtures / "config-patch.json").read_text(encoding="utf-8"))
     patched = deepcopy(source)
     for key in patch["delete_top_level"]:
         patched.pop(key, None)
@@ -97,14 +95,22 @@ def test_patch_removes_only_legacy_duplicates_and_preserves_effective_values():
         for segment in segments[:-1]:
             current = current.setdefault(segment, {})
         current[segments[-1]] = value
-    namespace = {}
-    exec((config_path.parent / "plugin" / "settings.py").read_text(), namespace)
-    before, after = namespace["ConfigView"](deepcopy(source)), ConfigView(patched)
+    before, after = ConfigView(deepcopy(source)), ConfigView(patched)
     excluded = {"advanced", "interest_topics"}
     first = {k: before[k] for k in before if k not in excluded}
     second = {k: after[k] for k in after if k not in excluded}
-    assert first == second
+    # Frozen expected values were evaluated by the pre-0.9.0 parser.
+    assert first == second == fixture["effective"]
     assert set(patch["set"]) == {"advanced.context.interest_topics"}
+    assert set(patch["delete_top_level"]) == {
+        "timeout_seconds",
+        "second_review",
+        "image_decision_mode",
+        "context_message_limit",
+        "natural_reply_threshold",
+        "reply_to_bot_wakes",
+        "min_reply_interval",
+    }
     assert before["interest_topics"] != after["interest_topics"]
 
 
