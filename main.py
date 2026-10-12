@@ -15,7 +15,15 @@ from contextvars import ContextVar
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import File, Image, Node, Nodes, Record, Video
+from astrbot.api.message_components import (
+    File,
+    Image,
+    Node,
+    Nodes,
+    Plain,
+    Record,
+    Video,
+)
 from astrbot.api.star import Context, Star
 from astrbot.core.agent.message import TextPart
 from astrbot.core.star.star_tools import StarTools
@@ -620,16 +628,19 @@ class JevActiveReply(Star):
     async def _send_audited(self, event, operation, args, kwargs):
         sequence = event.get_extra("_jev_send_sequence", 0) + 1
         event.set_extra("_jev_send_sequence", sequence)
+        event.set_extra("_jev_delivery_state", "started")
         details = {"send_sequence": sequence}
         self._note(event, "send_attempt", details)
         try:
             result = await operation(*args, **kwargs)
         except BaseException:
+            event.set_extra("_jev_delivery_state", "uncertain")
             self._note(event, "send_failed", details)
             raise
         receipt = result.get("message_id") if isinstance(result, dict) else None
         if isinstance(receipt, (str, int)):
             details = {**details, "receipt_id": str(receipt)[:128]}
+        event.set_extra("_jev_delivery_state", "completed")
         self._note(event, "send_completed", details)
         return result
 
@@ -856,6 +867,9 @@ class JevActiveReply(Star):
                 # Reserve order before the first await; never replace another slot.
                 slot = (native, copy.deepcopy(value))
                 fragments.append(slot)
+                if not native and chain is event.get_result():
+                    event.set_extra("_jev_collected_result", chain)
+                event.set_extra("_jev_delivery_state", "queued")
                 collectors.add(task)
                 idle.clear()
                 try:
@@ -1862,11 +1876,21 @@ class JevActiveReply(Star):
                 if expired:
                     meta["created"] = time.monotonic()
                 flush = event.get_extra("_jev_flush_output")
-                buffered = event.get_extra("_jev_buffered_content", lambda: False)()
-                if not buffered and not self._blocked(event):
+                if not self._blocked(event):
                     result = event.get_result()
-                    if result is not None and result.chain:
-                        await event.send(result)
+                    if (
+                        result is not None
+                        and result.chain
+                        and result is not event.get_extra("_jev_collected_result")
+                    ):
+                        sent_texts = event.get_extra(
+                            "_send_message_to_user_current_session_plain_texts", []
+                        )
+                        if not (
+                            all(isinstance(p, Plain) for p in result.chain)
+                            and result.get_plain_text().strip() in sent_texts
+                        ):
+                            await event.send(result)
                         event.set_result(event.chain_result([]))
                 if flush and not self._blocked(event):
                     await flush()
@@ -1877,7 +1901,14 @@ class JevActiveReply(Star):
                 event, "request_timeout_completed" if expired else "output_completed"
             )
         except Exception:
-            self._note(event, "output_completion_failed")
+            state = event.get_extra("_jev_delivery_state", "queued")
+            self._note(
+                event,
+                "output_completion_uncertain"
+                if state in {"started", "uncertain"}
+                else "output_completion_failed_before_send",
+                {"delivery_state": state},
+            )
         finally:
             meta["finished"] = True
             for request in event.get_extra("_jev_native_requests", []):
@@ -2115,20 +2146,7 @@ class JevActiveReply(Star):
                 event.set_extra(NORMAL, text)
             return
         if self._must_reply(event) and not meta.get("rejected"):
-            stopped = event.is_stopped()
             self._resume_required(event)
-            if stopped and not self._blocked(event):
-                # Buffered external text owns a stop just like delivered media.
-                flush = event.get_extra("_jev_flush_output")
-                if flush:
-                    await flush()
-                if (
-                    meta.get("sent_parts")
-                    or event.get_extra("_jev_buffered_content", lambda: False)()
-                ):
-                    await self._complete_output(event)
-                    silence.clear_output(event, response)
-                    return
         if self._blocked(event):
             self._reject(event, response, "silent_or_cancelled")
             return

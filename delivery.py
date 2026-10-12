@@ -78,6 +78,8 @@ async def plan_onebot(event, fragments):
 def install_completion_adapter():
     """Core has no completion hook for empty/stopped results; scope by event."""
     from astrbot.core.pipeline.process_stage.stage import ProcessStage
+    from astrbot.core.pipeline.respond.stage import RespondStage
+    from astrbot.core.pipeline.scheduler import PipelineScheduler
 
     original = ProcessStage.process
     if getattr(original, "_jev_completion", False):
@@ -95,6 +97,31 @@ def install_completion_adapter():
 
     process._jev_completion = True
     ProcessStage.process = process
+
+    original_stages = PipelineScheduler._process_stages
+
+    @wraps(original_stages)
+    async def stages(scheduler, event, from_stage=0):
+        try:
+            return await original_stages(scheduler, event, from_stage)
+        finally:
+            if from_stage == 0:
+                finish = event.get_extra("_jev_complete_output")
+                if finish is not None:
+                    await finish()
+
+    PipelineScheduler._process_stages = stages
+    original_respond = RespondStage.process
+
+    @wraps(original_respond)
+    async def respond(stage, event):
+        if event.get_extra("_jev_complete_output") is not None:
+            # A required turn submits once; Core's per-part delays cannot apply.
+            stage = copy.copy(stage)
+            stage.enable_seg = False
+        return await original_respond(stage, event)
+
+    RespondStage.process = respond
 
 
 class DeliveryDeclined(Exception):
