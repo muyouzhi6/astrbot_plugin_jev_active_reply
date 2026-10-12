@@ -474,6 +474,7 @@ class JevActiveReply(Star):
             )
             or event.get_extra("_jev_quiet_unavailable")
             or event.get_extra("_jev_context_failure_attempted")
+            or event.get_extra("_jev_send_sequence", 0)
             or self.closed
             or self._blocked(event)
             or event.get_extra(silence.RECALL)
@@ -1371,14 +1372,15 @@ class JevActiveReply(Star):
                 if remaining <= 0:
                     self._note(event, "candidate_wait_expired")
                     if required:
+                        # Close admission before transport, including lost receipts.
+                        burst.close(event)
+                        event.stop_event()
                         await self._send_audited(
                             event,
                             event.send,
                             (event.plain_result(silence.FALLBACK_REPLY),),
                             {},
                         )
-                        burst.close(event)
-                        event.stop_event()
                         self._note(event, "candidate_timeout_replied")
                     return
                 signal = room.changed
