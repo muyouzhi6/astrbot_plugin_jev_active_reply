@@ -30,7 +30,8 @@ def payload(bot):
         (["Use [PA"], ["Use [PA"]),
         (["["], ["["]),
         (["Use [", "x]"], ["Use [x]"]),
-        (["Answer", "[PASS]", "Next", "。"], ["Answer", "Next", "。"]),
+        (["Answer", "[PASS]", "Next", "。"], ["Answer", "Next。"]),
+        (["Answer", "[PASS]", "func(", ")"], ["Answer", "func()"]),
     ],
 )
 async def test_output_fragments(env, native, texts, expected):

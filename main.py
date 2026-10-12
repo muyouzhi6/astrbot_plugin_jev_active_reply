@@ -15,6 +15,7 @@ from contextvars import ContextVar
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star
 from astrbot.core.agent.message import TextPart
 from astrbot.core.star.star_tools import StarTools
@@ -610,17 +611,36 @@ class JevActiveReply(Star):
                         (p.__dict__, "text")
                         for p in silence._plain_components(chain.chain)
                     ]
-                    text_only = len(fields) == len(chain.chain)
+                    text_only = all(isinstance(p, Plain) for p in chain.chain)
                 if pending is not None and not final:
-                    if fields and text_only:
-                        _, target, field, _, _ = pending
-                        target[field] += "".join(c[k] for c, k in fields)
-                        if silence.incomplete_marker(target[field]):
-                            return None
-                        await flush()
+                    _, target, field, _, _ = pending
+                    continuation = "".join(c[k] for c, k in fields)
+                    ambiguous = silence.incomplete_marker(target[field])
+                    if (
+                        fields
+                        and text_only
+                        and (ambiguous or not silence._meaningful(continuation))
+                    ):
+                        target[field] += continuation
                         return None
+                    if fields and ambiguous:
+                        # Remove spans across sends without moving or consuming
+                        # any media or nested forwarding components.
+                        combined = [(target, field), *fields]
+                        joined = "".join(c[k] for c, k in combined)
+                        if silence.incomplete_marker(joined):
+                            fields[0][0][fields[0][1]] = (
+                                target[field] + fields[0][0][fields[0][1]]
+                            )
+                            target[field] = ""
+                        for (container, key_), text in zip(
+                            combined,
+                            silence._clean_texts([c[k] for c, k in combined]),
+                        ):
+                            container[key_] = text
                     await flush()
                 texts = [c[k] for c, k in fields]
+                follows_marker = meta.get("marker_tail")
                 if (
                     meta.get("marker_tail")
                     and texts
@@ -641,9 +661,20 @@ class JevActiveReply(Star):
                         args = (args[0], root["message"], *args[2:])
                 if (
                     not final
+                    and not meta.get("completing")
                     and fields
-                    and silence.incomplete_marker(fields[-1][0][fields[-1][1]])
+                    and (
+                        (text_only and follows_marker)
+                        or silence.incomplete_marker(fields[-1][0][fields[-1][1]])
+                    )
                 ):
+                    if not native:
+                        chain = copy.deepcopy(chain)
+                        args = (chain, *args[1:])
+                        fields = [
+                            (p.__dict__, "text")
+                            for p in silence._plain_components(chain.chain)
+                        ]
                     pending = (
                         (operation, args, kwargs, native),
                         *fields[-1],
@@ -2044,6 +2075,9 @@ class JevActiveReply(Star):
         meta = event.get_extra(MARK)
         if not meta:
             return
+        flush = event.get_extra("_jev_flush_output")
+        if flush and not self._blocked(event):
+            await flush()
         if (
             meta["rejected"]
             or not meta["reviewed"]
@@ -2077,6 +2111,9 @@ class JevActiveReply(Star):
         meta = event.get_extra(MARK)
         if not meta:
             return
+        flush = event.get_extra("_jev_flush_output")
+        if flush and not self._blocked(event):
+            await flush()
         result = event.get_result()
         if (
             result is not None
