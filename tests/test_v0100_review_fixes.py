@@ -249,7 +249,9 @@ async def test_takeover_bypasses_provider_wake_prefix_after_jev_admission(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["at", "private"])
-async def test_provider_prefix_respects_disabled_takeover_and_declined_turn(env, kind):
+async def test_provider_prefix_respects_disabled_takeover_and_allows_explicit_wake(
+    env, kind
+):
     env.settings["provider_settings"]["wake_prefix"] = "!"
     ev = incoming(kind)
     original = ev.get_message_str()
@@ -278,12 +280,30 @@ async def test_provider_prefix_respects_disabled_takeover_and_declined_turn(env,
         **env.response,
         "values": dict(addressed=0, continuation=0, worthwhile=0, intrusive=1),
     }
-    rejected = incoming(kind, mid="declined")
-    await env.plugin.on_input(rejected)
-    await env.plugin.on_message(rejected)
-    assert rejected.is_stopped()
-    assert rejected.get_message_str() == original
-    assert not rejected.get_extra(MARK)
+    explicit = incoming(kind, mid="explicit")
+    transport = AsyncMock()
+    explicit.send = transport
+    await env.plugin.on_input(explicit)
+    await env.plugin.on_message(explicit)
+    assert not explicit.is_stopped()
+    assert explicit.get_extra(MARK) and explicit.get_extra("_jev_takeover")
+    request, _ = await collect_request(explicit, env.ctx, config)
+    assert request is not None and request.prompt == original
+    await env.plugin.restore_takeover_message(explicit, request)
+    await env.plugin.on_request(explicit, request)
+    assert explicit.get_message_str() == original
+    response = LLMResponse(role="assistant", completion_text="合成的回答")
+    await env.plugin.on_response(explicit, response)
+    explicit.set_result(explicit.plain_result(response.completion_text))
+    await env.plugin.before_output(explicit)
+    if not explicit.is_stopped():
+        await explicit.send(explicit.get_result())
+    transport.assert_awaited_once()
+    assert transport.await_args.args[0].get_plain_text() == "合成的回答"
+    explicit.stop_event.assert_not_called()
+    env.plugin.client.evaluate.assert_awaited_once()
+    assert env.plugin.metrics.replies == 1
+    assert await env.plugin.ledger.acount(explicit.unified_msg_origin, "sent") == 1
 
 
 @pytest.mark.asyncio

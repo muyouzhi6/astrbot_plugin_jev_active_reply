@@ -127,7 +127,9 @@ async def test_takeover_admits_one_native_generation(env, kind):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["at", "prefix", "name", "private"])
 @pytest.mark.parametrize("failure", ["silence", "transport"])
-async def test_decline_stops_event_and_blocks_default_tail(env, kind, failure):
+async def test_explicit_wake_replies_once_despite_silence_or_judge_failure(
+    env, kind, failure
+):
     env.cfg.update(
         takeover_wake_messages=True, enable_private_chat=True, wake_names=["测试助手"]
     )
@@ -140,9 +142,14 @@ async def test_decline_stops_event_and_blocks_default_tail(env, kind, failure):
         env.plugin.client.evaluate.side_effect = DecisionError("transport_uncertain")
     ev, sent = incoming(kind), []
     await pipeline(env, ev, sent)
-    assert sent == [] and ev.is_stopped()
-    ev.stop_event.assert_called_once()
-    assert not ev.is_at_or_wake_command
+    assert sent == [ev] and not ev.is_stopped()
+    ev.stop_event.assert_not_called()
+    assert ev.get_result().get_plain_text() == "这是合成的回复"
+    assert ev.get_extra(MARK)["committed"] and ev.get_extra("_jev_takeover")
+    assert ev.get_extra("_test_generation_request").func_tool.names() == ["web_search"]
+    env.plugin.client.evaluate.assert_awaited_once()
+    assert env.plugin.metrics.replies == 1
+    assert await env.plugin.ledger.acount(ev.unified_msg_origin, "sent") == 1
 
 
 @pytest.mark.asyncio

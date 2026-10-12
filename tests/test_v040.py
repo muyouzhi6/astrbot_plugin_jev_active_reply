@@ -42,11 +42,14 @@ async def test_autonomous_silence_releases_lease_without_review_or_later_expiry(
 
 
 @pytest.mark.asyncio
-async def test_normal_and_private_silence_independent_switches(env):
+async def test_normal_silence_switch_preserves_explicit_and_private_replies(env):
     ev = base.event()
-    ev.is_at_or_wake_command = True
     assert await env.plugin.keep_silent(ev) is None
     assert ev.is_stopped()
+    explicit = base.event()
+    explicit.is_at_or_wake_command = True
+    assert isinstance(await env.plugin.keep_silent(explicit), str)
+    assert not explicit.is_stopped()
     private = base.event()
     private.message_obj.type = MessageType.FRIEND_MESSAGE
     assert private.is_private_chat()
@@ -54,8 +57,8 @@ async def test_normal_and_private_silence_independent_switches(env):
     assert isinstance(await env.plugin.keep_silent(private), str)
     assert not private.is_stopped()
     env.cfg["silence"]["private_replies"] = True
-    assert await env.plugin.keep_silent(private) is None
-    assert private.is_stopped()
+    assert isinstance(await env.plugin.keep_silent(private), str)
+    assert not private.is_stopped()
     env.cfg["silence"]["normal_replies"] = False
     normal = base.event()
     assert isinstance(await env.plugin.keep_silent(normal), str)
