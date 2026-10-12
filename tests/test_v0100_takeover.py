@@ -11,7 +11,8 @@ from astrbot.api.message_components import At, Plain, Image
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.platform.platform_metadata import PlatformMetadata
 from astrbot.core.pipeline.process_stage.stage import ProcessStage
-from astrbot.core.provider.entities import LLMResponse
+from astrbot.core.provider.entities import LLMResponse, ProviderRequest
+from astrbot.core.agent.tool import ToolSet
 
 from ..main import MARK
 from ..client import DecisionError
@@ -45,7 +46,7 @@ def incoming(kind, mid="one", text="模型上下文怎么处理", sender="human"
 
 
 async def pipeline(env, ev, sent, entered=None, release=None):
-    """Use the real ProcessStage; fake only provider completion and platform I/O."""
+    """Real ProcessStage and Jev hooks with synthetic handler/provider stages."""
     ev.send = AsyncMock()
 
     async def handlers(event):
@@ -59,6 +60,16 @@ async def pipeline(env, ev, sent, entered=None, release=None):
 
     async def generate(event):
         event.call_llm = True
+        tools = ToolSet()
+        tools.tools = [NS(name="keep_silent"), NS(name="web_search")]
+        request = ProviderRequest(
+            prompt=event.get_message_str(),
+            conversation=NS(cid=env.cid),
+            func_tool=tools,
+        )
+        await env.plugin.prepare_silence(event, request)
+        await env.plugin.on_request(event, request)
+        event.set_extra("_test_generation_request", request)
         if entered:
             entered.set()
             await release.wait()

@@ -509,6 +509,14 @@ class JevActiveReply(Star):
             task = asyncio.current_task()
             if nested.get() is task:
                 return await operation(*args, **kwargs)
+            # Core emits tool-call status chains while the agent is running.
+            # They are progress notifications, not the approved final reply.
+            chain = args[0] if args else None
+            if (
+                event.get_extra("_jev_takeover")
+                and getattr(chain, "type", None) == "tool_call"
+            ):
+                return None
             if not await self._permit(event):
                 raise DeliveryDeclined("autonomous_delivery_cancelled")
             meta = event.get_extra(MARK)
@@ -1207,9 +1215,17 @@ class JevActiveReply(Star):
             if (
                 runner not in (None, "local")
                 or provider_settings.get("wake_prefix")
-                or provider_settings.get("streaming_response")
-                or provider_settings.get("show_tool_use_status")
-                or provider_settings.get("show_tool_call_result")
+                or (
+                    not event.get_extra("_jev_takeover")
+                    and any(
+                        provider_settings.get(key)
+                        for key in (
+                            "streaming_response",
+                            "show_tool_use_status",
+                            "show_tool_call_result",
+                        )
+                    )
+                )
             ):
                 self._note(event, "unsupported_runtime_settings")
                 return
@@ -1238,6 +1254,8 @@ class JevActiveReply(Star):
                 },
             )
             event.set_extra("_active_trigger", True)
+            if event.get_extra("_jev_takeover"):
+                event.set_extra("enable_streaming", False)
             self.pending_events[ticket] = event
             room.phase = "generating"
             self._install_sender(event)
@@ -1424,7 +1442,7 @@ class JevActiveReply(Star):
                 self._note(event, "auxiliary_summary_deferred_until_draft")
         # Read-only tools retain perception; unsolicited side effects are not licensed.
         tools = getattr(req, "func_tool", None)
-        if tools is not None:
+        if tools is not None and not event.get_extra("_jev_takeover"):
             allowed = set(
                 self._cfg(
                     "proactive_tool_allowlist",
@@ -1891,18 +1909,15 @@ class JevActiveReply(Star):
     @filter.command("jev静音")
     async def quiet_room(self, event: AstrMessageEvent, minutes: int = 10):
         if (
-            event.is_private_chat()
-            or not self._cfg("enabled", True)
+            not self._cfg("enabled", True)
             or self._cfg("dry_run", False)
+            or (event.is_private_chat() and not self._enabled(event))
         ):
-            yield event.plain_result("群级静音仅在正式启用的群聊中生效。")
+            yield event.plain_result("当前未启用 Jev 管理功能。")
             return
         allow = self._cfg("enabled_sessions", [])
-        if not any(
-            x in allow
-            for x in ("*", event.unified_msg_origin, str(event.get_group_id()))
-        ):
-            yield event.plain_result("本群不在插件接管范围内。")
+        if not any(x in allow for x in ("*", *self._session_targets(event))):
+            yield event.plain_result("当前会话不在插件接管范围内。")
             return
         room = self.rooms.get(event.unified_msg_origin)
         if room is None:
@@ -1918,18 +1933,18 @@ class JevActiveReply(Star):
                 time.time() + minutes * 60,
             )
         yield event.plain_result(
-            f"本群暂停接话 {minutes} 分钟，已撤销未发送的自主回复。管理命令和已配置的过滤豁免对象不受影响。"
+            f"当前会话暂停接话 {minutes} 分钟，已撤销未发送的自主回复。管理命令和已配置的过滤豁免对象不受影响。"
         )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("jev开口")
     async def resume_room(self, event: AstrMessageEvent):
         if (
-            event.is_private_chat()
-            or self._cfg("dry_run", False)
+            self._cfg("dry_run", False)
             or not self._cfg("enabled", True)
+            or (event.is_private_chat() and not self._enabled(event))
         ):
-            yield event.plain_result("请在正式启用的群聊中使用。")
+            yield event.plain_result("当前未启用 Jev 管理功能。")
             return
         room = self.rooms.get(event.unified_msg_origin)
         if room is None:
@@ -1942,7 +1957,9 @@ class JevActiveReply(Star):
             room.quiet_loaded = True
             room.quiet_senders.clear()
             room.notify()
-        yield event.plain_result("本群沉默已解除，恢复按人设和语境判断，不补发旧消息。")
+        yield event.plain_result(
+            "当前会话沉默已解除，恢复按人设和语境判断，不补发旧消息。"
+        )
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("jev状态", alias={"jev诊断"})
