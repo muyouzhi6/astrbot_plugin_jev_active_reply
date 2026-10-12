@@ -1,6 +1,7 @@
 """Event-scoped delivery control with a transparent Core completion adapter."""
 
 import copy
+from dataclasses import dataclass
 from functools import wraps
 from types import SimpleNamespace
 
@@ -102,6 +103,56 @@ class DeliveryDeclined(Exception):
     pass
 
 
+@dataclass
+class QueuedDelivery:
+    """Queue acknowledgement, not a platform receipt; resolved at turn completion."""
+
+    action: str
+    args: tuple
+    params: dict
+    status: str = "queued"
+    receipt: object = None
+
+
+def native_delivery(event, action, args, params):
+    """Reject foreign or non-mergeable native calls before collecting their body."""
+    args, params = copy.deepcopy(args), copy.deepcopy(params)
+    request = QueuedDelivery(action, args, params)
+    if action == "call_action":
+        action, *rest = args
+        args = tuple(rest)
+    target = params
+    if action == "send":
+        target = args[0] if args else params.get("event", {})
+        if len(args) > 2 or set(params) - {"event", "message"}:
+            raise DeliveryDeclined("native_send_options_not_mergeable")
+    elif args or set(params) - {
+        "group_id",
+        "user_id",
+        "message",
+        "messages",
+        "message_type",
+        "self_id",
+    }:
+        raise DeliveryDeclined("native_send_options_not_mergeable")
+    group = bool(event.get_group_id())
+    key = "group_id" if group else "user_id"
+    expected = event.get_group_id() if group else event.get_sender_id()
+    kind = "group" if group else "private"
+    if (
+        action
+        not in {"send", "send_msg", f"send_{kind}_msg", f"send_{kind}_forward_msg"}
+        or str(target.get(key, "")) != str(expected)
+        or (action != "send" and target.get("user_id" if group else "group_id"))
+        or target.get("message_type", kind) != kind
+        or (
+            target.get("self_id") and str(target["self_id"]) != str(event.get_self_id())
+        )
+    ):
+        raise DeliveryDeclined("autonomous_cross_session_send")
+    return request
+
+
 class EventBotProxy:
     def __init__(self, bot, sender):
         self._bot, self._sender = bot, sender
@@ -118,14 +169,16 @@ class EventBotProxy:
         }:
 
             async def guarded(*args, **kwargs):
-                return await self._sender(original, *args, **kwargs)
+                return await self._sender(original, *args, _jev_action=name, **kwargs)
 
             return guarded
         if name == "call_action":
 
             async def action(action, *args, **kwargs):
                 if str(action).startswith("send_"):
-                    return await self._sender(original, action, *args, **kwargs)
+                    return await self._sender(
+                        original, action, *args, _jev_action="call_action", **kwargs
+                    )
                 return await original(action, *args, **kwargs)
 
             return action

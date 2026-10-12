@@ -462,7 +462,8 @@ async def test_native_decorator_send_repairs_actual_payload(env, route, form):
 
     async def native(ev):
         result = await send_native(ev, route, message)
-        assert result == ({"message_id": 42} if form == "media" else None)
+        assert result.status == "queued"
+        assert result.receipt is None
 
     await pipeline(env, event, adapter=True, native_send=native)
     payload = platform_payload(bot)

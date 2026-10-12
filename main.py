@@ -33,6 +33,7 @@ from .client import DecisionError, JevClient
 from .delivery import (
     DeliveryDeclined,
     EventBotProxy,
+    native_delivery,
     SplitAdapters,
     install_completion_adapter,
     plan_onebot,
@@ -632,6 +633,8 @@ class JevActiveReply(Star):
         original_send = event.send
         nested = ContextVar("jev_delivery_owner", default=None)
         fragments = []
+        native_requests = []
+        event.set_extra("_jev_native_requests", native_requests)
         collectors = set()
         idle = asyncio.Event()
         idle.set()
@@ -689,7 +692,16 @@ class JevActiveReply(Star):
                 if not await self._permit(event):
                     await self._context_failure_reply(event)
                     raise DeliveryDeclined("autonomous_delivery_cancelled")
-                await transmit(event.bot.call_action, (action,), params)
+                try:
+                    receipt = await transmit(event.bot.call_action, (action,), params)
+                except BaseException:
+                    for request in native_requests:
+                        request.status = "failed"
+                    raise
+                else:
+                    for request in native_requests:
+                        request.status = "delivered"
+                        request.receipt = receipt
             else:
                 chain = event.chain_result(
                     [
@@ -765,7 +777,7 @@ class JevActiveReply(Star):
                 nested.reset(token)
                 self.tasks.discard(task)
 
-        async def send_operation(operation, args, kwargs, native=False):
+        async def send_operation(operation, args, kwargs, native=False, action=None):
             task = asyncio.current_task()
             if nested.get() is task:
                 if native:
@@ -782,6 +794,7 @@ class JevActiveReply(Star):
                 if sealed or meta.get("finished"):
                     raise DeliveryDeclined("output_already_completed")
                 if native:
+                    request = native_delivery(event, action, args, kwargs)
                     value = next(
                         (kwargs[k] for k in ("message", "messages") if k in kwargs),
                         None,
@@ -805,6 +818,9 @@ class JevActiveReply(Star):
                 finally:
                     collectors.discard(task)
                     idle.set()
+                if native:
+                    native_requests.append(request)
+                    return request
                 return None
             if not await self._permit(event):
                 await self._context_failure_reply(event)
@@ -814,8 +830,10 @@ class JevActiveReply(Star):
         async def send(chain, *args, **kwargs):
             return await send_operation(original_send, (chain, *args), kwargs)
 
-        async def native_send(operation, *args, **kwargs):
-            return await send_operation(operation, args, kwargs, native=True)
+        async def native_send(operation, *args, _jev_action=None, **kwargs):
+            return await send_operation(
+                operation, args, kwargs, native=True, action=_jev_action
+            )
 
         event.send = send
         if getattr(event, "bot", None) is not None:
@@ -1805,6 +1823,9 @@ class JevActiveReply(Star):
             self._note(event, "output_completion_failed")
         finally:
             meta["finished"] = True
+            for request in event.get_extra("_jev_native_requests", []):
+                if request.status == "queued":
+                    request.status = "cancelled"
             self._release(event)
             if expired:
                 meta["rejected"] = True
@@ -2340,16 +2361,8 @@ class JevActiveReply(Star):
         meta = event.get_extra(MARK)
         if meta:
             if self._must_reply(event):
-                await self._complete_output(event)
-            # Late decorators may consume the result using only silent sends.
-            # Decide fallback after the complete output, never per fragment.
-            if (
-                self._must_reply(event)
-                and not meta.get("sent_parts")
-                and not meta.get("finished")
-                and not self._blocked(event)
-            ):
-                await event.send(event.plain_result(silence.FALLBACK_REPLY))
+                # RespondStage runs after each Core yield, not after generation.
+                return
             if (
                 not meta.get("committed")
                 and not meta.get("rejected")

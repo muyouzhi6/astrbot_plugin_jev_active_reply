@@ -118,7 +118,8 @@ async def test_native_send_receipt_contract(env, kind):
     target = {"user_id": 123456789} if kind == "private" else {"group_id": 987654321}
     receipt = await event.bot.send_msg(message="Synthetic answer", **target)
     await env.plugin._complete_output(event)
-    assert receipt is None
+    assert receipt.status == "delivered"
+    assert receipt.receipt == {"message_id": 42}
     assert bot.transport.await_count == 1
     assert any(
         r == "send_completed" and d.get("receipt_id") == "42"
@@ -171,7 +172,7 @@ async def test_completion_waits_for_transport(env, monkeypatch, expired, fail):
         assert not event.get_extra(MARK).get("finished")
         release.set()
         results = await asyncio.gather(sending, finishing, return_exceptions=True)
-        assert results[0] is None
+        assert results[0].status == ("failed" if fail else "delivered")
         assert results[1] is None
         assert bot.transport.await_count == 1
         assert event.get_extra(MARK)["finished"]

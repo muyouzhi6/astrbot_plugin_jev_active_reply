@@ -170,6 +170,8 @@ async def test_dispatched_terminal(env, mode):
         )
         event.stop_event()
         await env.plugin.after_sent(event)
+        assert bot.transport.await_count == 0
+        await event.get_extra("_jev_complete_output")()
     else:
         env.plugin._expire(event)
         await asyncio.sleep(0.05)

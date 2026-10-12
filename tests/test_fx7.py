@@ -90,7 +90,9 @@ async def test_native_punctuation_not_standalone(env, kind, payload):
 
     await pipeline(env, event, adapter=True, native_send=emit)
     assert texts(bot) == ["Synthetic answer。"]
-    assert receipts == [None, None]
+    assert all(
+        r.status == "delivered" and r.receipt == {"message_id": 42} for r in receipts
+    )
 
 
 @pytest.mark.asyncio

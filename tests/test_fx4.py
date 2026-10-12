@@ -114,8 +114,12 @@ async def test_online_lifecycle(env, monkeypatch, kind, mode):
         )
         await asyncio.wait_for(entered.wait(), 3)
         if mode == "early_media_stop":
-            await event.bot.send_group_msg(
-                group_id=987654321,
+            await event.bot.send_msg(
+                **(
+                    {"user_id": 123456789}
+                    if kind == "private"
+                    else {"group_id": 987654321}
+                ),
                 message=[{"type": "image", "data": {"file": "base64://c3ludGhldGlj"}}],
             )
             event.stop_event()
@@ -257,8 +261,12 @@ async def test_real_scheduler(env, kind, mode, admin):
     async def generate(ev):
         ev.call_llm = True
         if mode == "early_media_stop":
-            await ev.bot.send_group_msg(
-                group_id=987654321,
+            await ev.bot.send_msg(
+                **(
+                    {"user_id": 123456789}
+                    if kind == "private"
+                    else {"group_id": 987654321}
+                ),
                 message=[{"type": "image", "data": {"file": "base64://c3ludGhldGlj"}}],
             )
             ev.stop_event()

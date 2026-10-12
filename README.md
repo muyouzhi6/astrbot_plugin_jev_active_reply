@@ -129,7 +129,7 @@ Jev 本身是文字判断模型，不识别图片像素。毫无配文和对话�
 
 发送保护接入 AstrBot 原生事件、Agent 与平台发送链；第三方插件直接调用独立机器人客户端时由其管理发送。
 
-接管事件上的原生 `bot.send_*` 调用先将片段入队，返回 `None`；本轮完成后统一发送，真实平台消息 ID 写入 `send_completed` 审计。依赖立即获取消息 ID 的插件应在接管关闭的会话使用原生发送。
+接管事件上的原生 `bot.send_*` 调用返回 `QueuedDelivery` 入队确认，`status` 初始为 `queued`，不是平台回执。整轮结束后统一发送，成功时 `status=delivered`，`receipt` 保存平台返回值（含 `message_id`）；发送失败为 `failed`，发送前取消为 `cancelled`。依赖消息 ID 的扩展应在整轮结束后读取 `receipt`，不要在生成或装饰回调中等待整轮结束。异会话收件目标和无法合并的原生参数抛出 `DeliveryDeclined`，不会改投当前会话。接管关闭时原生 API 返回行为不变。
 
 ## 常见问题
 
