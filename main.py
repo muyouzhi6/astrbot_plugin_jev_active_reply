@@ -399,8 +399,7 @@ class JevActiveReply(Star):
         ):
             self._reject(event, None, "unapproved_output_suppressed")
             return False
-        if time.monotonic() - meta["created"] > self._lifetime():
-            self._reject(event, None, "delivery_expired")
+        if await self._finish_expired(event, "delivery_expired"):
             return False
         try:
             cid, _ = await self._read_conversation(event)
@@ -418,8 +417,7 @@ class JevActiveReply(Star):
             or self._quiet(event, room)
         ):
             return False
-        if time.monotonic() - meta["created"] > self._lifetime():
-            self._reject(event, None, "delivery_expired")
+        if await self._finish_expired(event, "delivery_expired"):
             return False
         if (
             (meta["cid"] and cid != meta["cid"])
@@ -1000,8 +998,6 @@ class JevActiveReply(Star):
         if not any(value in allow for value in ("*", *self._session_targets(event))):
             return
         room = self.rooms.get(event.unified_msg_origin)
-        if room is None:
-            return
         settings = self.context.get_config(umo=event.unified_msg_origin)
         # Core resolves command filters before running message handlers.
         if (
@@ -1010,7 +1006,10 @@ class JevActiveReply(Star):
             event.set_extra("_jev_command_owned", True)
             return
         action, reason = input_decision(
-            event, self.config, room.last_text, settings.get("wake_prefix", [])
+            event,
+            self.config,
+            room.last_text if room else "",
+            settings.get("wake_prefix", []),
         )
         event.set_extra("_jev_input_action", action)
         if action == "block":
@@ -1041,6 +1040,13 @@ class JevActiveReply(Star):
             return
         if action in ("pass", "skip") and event.is_at_or_wake_command:
             action, reason = "direct", "native_explicit_wake"
+        if room is None:
+            # Do not revoke native handling until a room can be reserved.
+            if action == "direct":
+                event.is_at_or_wake_command = True
+            elif action == "quiet":
+                event.stop_event()
+            return
         await self._load_quiet(event, room)
         sender = str(event.get_sender_id())
         now = time.monotonic()
@@ -1133,6 +1139,9 @@ class JevActiveReply(Star):
             return  # No request ownership was accepted; retain the native wake.
         self._must_reply(event)
         if owned:
+            if self.rooms.get(event.unified_msg_origin) is None:
+                self._note(event, "room_capacity_native_wake")
+                return
             event.set_extra("_jev_takeover", True)
             event.set_extra("_jev_context_failure_sender", event.send)
             event.set_extra(
@@ -1189,10 +1198,7 @@ class JevActiveReply(Star):
             self._note(event, "command_not_an_autonomous_topic")
             return
         for old in list(self.pending_events.values()):
-            meta = old.get_extra(MARK)
-            if meta and time.monotonic() - meta["created"] > self._lifetime():
-                old.set_extra("agent_stop_requested", True)
-                self._reject(old, None, "expired_request")
+            await self._finish_expired(old, "expired_request")
         if str(event.get_sender_id()) == str(event.get_self_id()):
             return
         room = self.rooms.get(event.unified_msg_origin)
@@ -1688,6 +1694,20 @@ class JevActiveReply(Star):
             for name, threshold in thresholds
         )
 
+    async def _finish_expired(self, event, reason):
+        meta = event.get_extra(MARK)
+        if (
+            not meta
+            or meta.get("completing")
+            or time.monotonic() - meta["created"] <= self._lifetime()
+        ):
+            return False
+        if self._must_reply(event):
+            await self._complete_output(event, expired=True)
+        else:
+            self._reject(event, None, reason)
+        return True
+
     def _expire(self, event):
         self._restore_native_prefix(event)
         meta = event.get_extra(MARK)
@@ -1763,10 +1783,9 @@ class JevActiveReply(Star):
         meta = event.get_extra(MARK)
         if not meta:
             return
-        if (
-            self._blocked(event)
-            or time.monotonic() - meta["created"] > self._lifetime()
-        ):
+        if await self._finish_expired(event, "cancelled_before_generation"):
+            return
+        if self._blocked(event):
             self._reject(event, None, "cancelled_before_generation")
             return
         if meta["cid"] and str(getattr(req.conversation, "cid", "")) != meta["cid"]:
@@ -2192,15 +2211,12 @@ class JevActiveReply(Star):
         meta = event.get_extra(MARK)
         if not meta:
             return
+        if await self._finish_expired(event, "output_cancelled"):
+            return
         flush = event.get_extra("_jev_flush_output")
         if flush and not self._blocked(event):
             await flush()
-        if (
-            meta["rejected"]
-            or not meta["reviewed"]
-            or self._blocked(event)
-            or time.monotonic() - meta["created"] > self._lifetime()
-        ):
+        if meta["rejected"] or not meta["reviewed"] or self._blocked(event):
             self._reject(event, None, "output_cancelled")
             return
         result = event.get_result()
@@ -2215,6 +2231,8 @@ class JevActiveReply(Star):
             return
         meta["output_ready"] = bool(result and result.chain)
         if not meta["output_ready"]:
+            if self._must_reply(event):
+                return  # Core completion owns an empty required result.
             self._release(event)
             meta["finished"] = True
             self._note(event, "empty_output")
@@ -2248,6 +2266,8 @@ class JevActiveReply(Star):
             # Plan forwards before Core splits the result into individual sends.
             silence.combine_forward_reply(result, event.get_self_id())
         if self._blocked(event) or not result or not result.chain:
+            if self._must_reply(event):
+                return  # A consuming decorator is not proof of delivery.
             self._release(event)
             meta["finished"] = True
             self._note(
