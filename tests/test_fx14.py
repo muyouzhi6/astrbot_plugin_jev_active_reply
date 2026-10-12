@@ -32,7 +32,9 @@ async def test_cq_string_media(env, kind, escape, media):
     cq = f"[CQ:{media},file=base64://c3ludGhldGlj]"
 
     async def emit(ev):
-        target = {"user_id": 123456789} if kind == "private" else {"group_id": 987654321}
+        target = (
+            {"user_id": 123456789} if kind == "private" else {"group_id": 987654321}
+        )
         if escape is not None:
             target["auto_escape"] = escape
         await ev.bot.send_msg(**target, message=cq)
@@ -83,6 +85,7 @@ async def test_log_lifecycle_combinations(env, monkeypatch, kind, mode):
         monkeypatch.setattr(env.plugin, "_lifetime", lambda: 0.015)
         await pipeline(env, event, "[PASS]。", adapter=True)
     elif mode == "multi":
+
         async def emit(ev):
             for text in ["First body", "[PA", "SS]。", "Second body"]:
                 await ev.send(ev.plain_result(text))
@@ -100,7 +103,9 @@ async def test_log_lifecycle_combinations(env, monkeypatch, kind, mode):
         env.plugin.client.evaluate = evaluate
         entered, release = asyncio.Event(), asyncio.Event()
         task = asyncio.create_task(
-            pipeline(env, event, "[不回复]", adapter=True, generation_gate=(entered, release))
+            pipeline(
+                env, event, "[不回复]", adapter=True, generation_gate=(entered, release)
+            )
         )
         try:
             await asyncio.wait_for(entered.wait(), 3)
@@ -108,8 +113,17 @@ async def test_log_lifecycle_combinations(env, monkeypatch, kind, mode):
                 env.plugin._expire(event)
                 await asyncio.sleep(0.03)
             else:
-                target = {"user_id": 123456789} if kind == "private" else {"group_id": 987654321}
-                await event.bot.send_msg(**target, message=[{"type": "image", "data": {"file": "base64://c3ludGhldGlj"}}])
+                target = (
+                    {"user_id": 123456789}
+                    if kind == "private"
+                    else {"group_id": 987654321}
+                )
+                await event.bot.send_msg(
+                    **target,
+                    message=[
+                        {"type": "image", "data": {"file": "base64://c3ludGhldGlj"}}
+                    ],
+                )
                 event.stop_event()
         finally:
             release.set()

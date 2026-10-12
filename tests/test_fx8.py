@@ -100,6 +100,9 @@ async def test_real_response_stop_hooks(env, monkeypatch, kind, output, priority
     assert bot.transport.await_count == 1, payload(bot)
     if output == "plain":
         assert "Synthetic external answer" in payload(bot)
+    if output == "media":
+        assert '"type": "image"' in payload(bot)
+        assert "我在，请再说一下你的问题。" not in payload(bot)
     assert event.get_extra(MARK)["finished"]
     assert not env.plugin.rooms.get(event.unified_msg_origin).pending
 

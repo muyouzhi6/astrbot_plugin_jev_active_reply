@@ -796,12 +796,7 @@ class JevActiveReply(Star):
                     raise DeliveryDeclined("output_already_completed")
                 if native:
                     request = native_delivery(event, action, args, kwargs)
-                    value = next(
-                        (kwargs[k] for k in ("message", "messages") if k in kwargs),
-                        None,
-                    )
-                    if value is None and len(args) > 1:
-                        value = args[1]
+                    value = request.message_segments()
                 else:
                     value = chain
                 # Reserve order before the first await; never replace another slot.

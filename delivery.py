@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from functools import wraps
 from types import SimpleNamespace
 
+from aiocqhttp.message import Message
 from astrbot.api.message_components import Node, Nodes
 
 from . import silence
@@ -19,10 +20,6 @@ async def plan_onebot(event, fragments):
     parts = []
     for native, value in fragments:
         if native:
-            if isinstance(value, str):
-                value = [{"type": "text", "data": {"text": value}}]
-            if isinstance(value, dict):
-                value = value.get("messages", [value])
             parts.extend(value)
         else:
             for component in value.chain:
@@ -103,6 +100,30 @@ class DeliveryDeclined(Exception):
     pass
 
 
+def _native_segments(value, *, auto_escape=False):
+    """Convert only native CQ strings; JSON text segments remain opaque."""
+    if isinstance(value, str):
+        if auto_escape:
+            return [{"type": "text", "data": {"text": value}}]
+        return [dict(segment) for segment in Message(value)]
+    if isinstance(value, dict):
+        if "messages" in value:
+            return _native_segments(value["messages"])
+        value = [value]
+    parts = []
+    for part in value or []:
+        if isinstance(part, str):
+            parts.extend(_native_segments(part))
+            continue
+        part = copy.deepcopy(part)
+        if part.get("type") == "node" and isinstance(part.get("data"), dict):
+            data = part["data"]
+            if "content" in data:
+                data["content"] = _native_segments(data["content"])
+        parts.append(part)
+    return parts
+
+
 @dataclass
 class QueuedDelivery:
     """Queue acknowledgement, not a platform receipt; resolved at turn completion."""
@@ -112,6 +133,14 @@ class QueuedDelivery:
     params: dict
     status: str = "queued"
     receipt: object = None
+
+    def message_segments(self):
+        value = self.params.get("message", self.params.get("messages"))
+        if value is None and len(self.args) > 1:
+            value = self.args[1]
+        return _native_segments(
+            value, auto_escape=self.params.get("auto_escape", False)
+        )
 
 
 def native_delivery(event, action, args, params):
@@ -124,7 +153,7 @@ def native_delivery(event, action, args, params):
     target = params
     if action == "send":
         target = args[0] if args else params.get("event", {})
-        if len(args) > 2 or set(params) - {"event", "message"}:
+        if len(args) > 2 or set(params) - {"event", "message", "auto_escape"}:
             raise DeliveryDeclined("native_send_options_not_mergeable")
     elif args or set(params) - {
         "group_id",
@@ -133,7 +162,10 @@ def native_delivery(event, action, args, params):
         "messages",
         "message_type",
         "self_id",
+        "auto_escape",
     }:
+        raise DeliveryDeclined("native_send_options_not_mergeable")
+    if "forward_msg" in action and "auto_escape" in params:
         raise DeliveryDeclined("native_send_options_not_mergeable")
     group = bool(event.get_group_id())
     key = "group_id" if group else "user_id"
