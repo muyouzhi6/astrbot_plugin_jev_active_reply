@@ -83,7 +83,9 @@ async def test_plain_tail_preserved_with_body(env, kind, native, body, tail):
     await pipeline(
         env, event, adapter=True, native_send=emit, decoration_priority=-200000
     )
-    assert texts(bot) == ["First answer", body + tail]
+    assert texts(bot) == (
+        ["First answer", body, tail] if native else ["First answer", body + tail]
+    )
     assert event.get_extra(MARK)["finished"]
 
 

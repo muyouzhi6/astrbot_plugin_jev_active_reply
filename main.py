@@ -663,7 +663,7 @@ class JevActiveReply(Star):
                     and not meta.get("completing")
                     and fields
                     and (
-                        text_only
+                        (text_only and not native)
                         or silence.incomplete_marker(fields[-1][0][fields[-1][1]])
                     )
                 ):
@@ -720,6 +720,8 @@ class JevActiveReply(Star):
                             *args[2:],
                         )
             token = nested.set(task)
+            idle = meta.setdefault("send_idle", asyncio.Event())
+            idle.clear()
             meta["send_depth"] = meta.get("send_depth", 0) + 1
             frame = event.get_extra(burst.FRAME)
             if frame:
@@ -735,6 +737,8 @@ class JevActiveReply(Star):
                 return result
             finally:
                 meta["send_depth"] -= 1
+                if not meta["send_depth"]:
+                    idle.set()
                 if frame:
                     frame.sending -= 1
                 nested.reset(token)
@@ -1205,6 +1209,11 @@ class JevActiveReply(Star):
                 )
             except Exception:
                 self._note(event, "conversation_unavailable")
+                if self._must_reply(event) and not self._blocked(event):
+                    await event.send(event.plain_result(silence.FALLBACK_REPLY))
+                    burst.close(event)
+                    event.stop_event()
+                    self._note(event, "conversation_failure_replied")
                 return
             if self._blocked(event):
                 return
@@ -1610,7 +1619,7 @@ class JevActiveReply(Star):
         self._restore_native_prefix(event)
         meta = event.get_extra(MARK)
         if meta and not meta.get("finished"):
-            if self._must_reply(event) and not meta.get("send_depth"):
+            if self._must_reply(event):
                 task = asyncio.create_task(self._complete_output(event, expired=True))
                 self.tasks.add(task)
                 task.add_done_callback(self.tasks.discard)
@@ -1634,12 +1643,19 @@ class JevActiveReply(Star):
         ):
             event.continue_event()
 
+    @staticmethod
+    async def _wait_delivery(meta):
+        # A transport already started owns the outcome; never race it with fallback.
+        while meta.get("send_depth"):
+            await meta["send_idle"].wait()
+
     async def _complete_output(self, event, expired=False):
         meta = event.get_extra(MARK)
         if not meta or meta.get("finished") or meta.get("completing"):
             return
         meta["completing"] = True
         try:
+            await self._wait_delivery(meta)
             if self._must_reply(event) and not meta.get("rejected"):
                 # A plugin stopping propagation is not a user recall. Preserve
                 # explicit cancellation flags, but finish an otherwise owed reply.
@@ -1898,6 +1914,10 @@ class JevActiveReply(Star):
             return
         required = self._must_reply(event)
         if required:
+            await self._wait_delivery(meta)
+            if meta.get("rejected") or meta.get("finished"):
+                silence.clear_output(event, response)
+                return
             silence.repair_required_reply(
                 response=response, fallback=not meta.get("sent_parts")
             )
@@ -2094,6 +2114,7 @@ class JevActiveReply(Star):
             return
         result = event.get_result()
         if self._must_reply(event):
+            await self._wait_delivery(meta)
             silence.repair_required_reply(
                 result=result, fallback=not meta.get("sent_parts")
             )
