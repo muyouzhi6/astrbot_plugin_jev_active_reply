@@ -552,7 +552,7 @@ class JevActiveReply(Star):
             if self._must_reply(event):
                 if not native and hasattr(chain, "chain"):
                     silence.repair_required_reply(
-                        result=chain, fallback=not meta.get("sent_parts")
+                        result=chain, fallback=False
                     )
                     # Core can send Record first, then a marker-only remainder.
                     if not silence.has_reply_content(chain.chain):
@@ -565,7 +565,7 @@ class JevActiveReply(Star):
                             kwargs[key] = silence.repair_native_reply(
                                 kwargs[key],
                                 forward=key == "messages",
-                                fallback=not meta.get("sent_parts"),
+                                fallback=False,
                             )
                             if kwargs[key] is None:
                                 return None
@@ -573,7 +573,7 @@ class JevActiveReply(Star):
                     # call_action has only the action name before keyword params.
                     if len(args) > 1:
                         message = silence.repair_native_reply(
-                            args[1], fallback=not meta.get("sent_parts")
+                            args[1], fallback=False
                         )
                         if message is None:
                             return None
@@ -1915,6 +1915,13 @@ class JevActiveReply(Star):
             and self._must_reply(event)
         ):
             silence.repair_required_reply(result=result)
+        if (
+            result is not None
+            and self._must_reply(event)
+            and event.get_platform_name() == "aiocqhttp"
+        ):
+            # Plan forwards before Core splits the result into individual sends.
+            silence.combine_forward_reply(result, event.get_self_id())
         if self._blocked(event) or not result or not result.chain:
             self._release(event)
             meta["finished"] = True
@@ -1938,6 +1945,15 @@ class JevActiveReply(Star):
             return
         meta = event.get_extra(MARK)
         if meta:
+            # Late decorators may consume the result using only silent sends.
+            # Decide fallback after the complete output, never per fragment.
+            if (
+                self._must_reply(event)
+                and not meta.get("sent_parts")
+                and not meta.get("finished")
+                and not self._blocked(event)
+            ):
+                await event.send(event.plain_result(silence.FALLBACK_REPLY))
             if (
                 not meta.get("committed")
                 and not meta.get("rejected")

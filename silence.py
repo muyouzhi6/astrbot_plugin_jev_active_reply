@@ -44,13 +44,15 @@ def _clean_texts(values):
     for value in values:
         end = offset + len(value)
         cursor, kept = 0, []
+        touched = False
         for start, stop in spans:
             if start < end and stop > offset:
+                touched = True
                 kept.append(value[cursor : max(0, start - offset)])
                 cursor = min(len(value), stop - offset)
         kept.append(value[cursor:])
         cleaned = "".join(kept)
-        yield cleaned if _meaningful(cleaned) else ""
+        yield "" if touched and not _meaningful(cleaned) else cleaned
         offset = end
 
 
