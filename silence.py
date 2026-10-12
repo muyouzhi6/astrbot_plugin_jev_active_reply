@@ -266,8 +266,9 @@ def repair_native_reply(message, *, forward=False, fallback=True):
         fields, _clean_texts([container[key] for container, key in fields])
     ):
         container[key] = text
+    text = "".join(container[key] for container, key in fields).strip()
     if not _native_has_content(root["message"]) and not (
-        not fallback and any(container[key].strip() for container, key in fields)
+        not fallback and text and text.strip("。.!！?？… \t\r\n")
     ):
         if not fallback:
             return None

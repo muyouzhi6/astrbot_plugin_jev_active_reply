@@ -383,8 +383,10 @@ class JevActiveReply(Star):
             not meta
             or self.closed
             or self._blocked(event)
+            or event.get_extra(silence.RECALL)
             or meta.get("rejected")
             or meta.get("finished")
+            or event.get_extra("_jev_context_unavailable")
         ):
             return False
         if room:
@@ -401,14 +403,16 @@ class JevActiveReply(Star):
             self._reject(event, None, "delivery_expired")
             return False
         try:
-            cid, _ = await bridge.conversation(self.context, event)
+            cid, _ = await self._read_conversation(event)
         except Exception:
-            self._reject(event, None, "delivery_context_unavailable")
+            if not self._must_reply(event):
+                self._reject(event, None, "delivery_context_unavailable")
             return False
         # Revalidate after the final await: expiry/recall/replacement may have won.
         if (
             self.closed
             or self._blocked(event)
+            or event.get_extra(silence.RECALL)
             or meta.get("rejected")
             or meta.get("finished")
             or self._quiet(event, room)
@@ -438,6 +442,47 @@ class JevActiveReply(Star):
             self._reject(event, None, "delivery_context_changed")
             return False
         return True
+
+    async def _read_conversation(self, event):
+        if not self._must_reply(event):
+            return await bridge.conversation(self.context, event)
+        for attempt in range(2):
+            try:
+                return await asyncio.wait_for(
+                    bridge.conversation(self.context, event), 3
+                )
+            except Exception:
+                if attempt:
+                    event.set_extra("_jev_context_unavailable", True)
+                    raise
+
+    async def _context_failure_reply(self, event):
+        meta = event.get_extra(MARK, {})
+        if meta:
+            await self._wait_delivery(meta)
+        room = self.rooms.rooms.get(event.unified_msg_origin)
+        send = event.get_extra("_jev_context_failure_sender")
+        if (
+            not send
+            or not event.get_extra("_jev_context_unavailable")
+            or event.get_extra("_jev_context_failure_attempted")
+            or self.closed
+            or self._blocked(event)
+            or event.get_extra(silence.RECALL)
+            or self._quiet(event, room)
+            or meta.get("rejected")
+            or meta.get("sent_parts")
+        ):
+            return
+        # No conversation-dependent draft may escape while storage is unavailable.
+        # Record the attempt before transport; an ambiguous failure is not retried.
+        event.set_extra("_jev_context_failure_attempted", True)
+        await send(event.plain_result(silence.FALLBACK_REPLY))
+        if meta:
+            await self._accepted(event)
+        burst.close(event)
+        event.stop_event()
+        self._note(event, "conversation_failure_replied")
 
     @staticmethod
     def _quiet(event, room):
@@ -548,7 +593,16 @@ class JevActiveReply(Star):
         original_send = event.send
         nested = ContextVar("jev_delivery_owner", default=None)
         pending = None
+
+        async def context_failure_send(chain):
+            token = nested.set(asyncio.current_task())
+            try:
+                return await original_send(chain)
+            finally:
+                nested.reset(token)
+
         if self._must_reply(event):
+            event.set_extra("_jev_context_failure_sender", context_failure_send)
             event.set_extra(
                 "_jev_complete_output", lambda: self._complete_output(event)
             )
@@ -582,6 +636,7 @@ class JevActiveReply(Star):
             ):
                 return None
             if not await self._permit(event):
+                await self._context_failure_reply(event)
                 raise DeliveryDeclined("autonomous_delivery_cancelled")
             meta = event.get_extra(MARK)
             # A decorator may replace the result or send its own chain after
@@ -1075,12 +1130,18 @@ class JevActiveReply(Star):
         self._must_reply(event)
         if owned:
             event.set_extra("_jev_takeover", True)
+            event.set_extra("_jev_context_failure_sender", event.send)
+            event.set_extra(
+                "_jev_complete_output", lambda: self._context_failure_reply(event)
+            )
             # Suppress the unapproved native wake; only an admitted Jev turn
             # re-enables the single native generation tail below.
             event.is_at_or_wake_command = False
         try:
             await self._on_message(event)
         finally:
+            if not event.get_extra(MARK):
+                await self._context_failure_reply(event)
             if (owned or event.get_extra("_jev_takeover")) and not event.get_extra(
                 MARK
             ):
@@ -1202,6 +1263,10 @@ class JevActiveReply(Star):
                 return
         # Record segments in ingress order even if a newer fragment arrived while
         # the conversation lookup awaited I/O. Stale candidates do not generate.
+        if self._must_reply(event) and not event.get_extra(
+            "_jev_context_failure_sender"
+        ):
+            event.set_extra("_jev_context_failure_sender", event.send)
         async with room.ingress_lock:
             try:
                 cid, _ = await asyncio.wait_for(
@@ -1209,11 +1274,7 @@ class JevActiveReply(Star):
                 )
             except Exception:
                 self._note(event, "conversation_unavailable")
-                if self._must_reply(event) and not self._blocked(event):
-                    await event.send(event.plain_result(silence.FALLBACK_REPLY))
-                    burst.close(event)
-                    event.stop_event()
-                    self._note(event, "conversation_failure_replied")
+                event.set_extra("_jev_context_unavailable", True)
                 return
             if self._blocked(event):
                 return
@@ -1356,7 +1417,7 @@ class JevActiveReply(Star):
                     raise
                 # The native collector still loads the real persona and history.
                 # An unavailable Jev snapshot must not revoke the user's request.
-                cid, conv = await bridge.conversation(self.context, event)
+                cid, conv = await self._read_conversation(event)
                 history_hash = bridge.fingerprint(conv)
                 state = {"target_message": target, "activity": {}, "truncated": False}
                 snapshot_ready = False
@@ -1480,7 +1541,7 @@ class JevActiveReply(Star):
             ):
                 self._note(event, "superseded")
                 return
-            fresh_cid, conv = await bridge.conversation(self.context, event)
+            fresh_cid, conv = await self._read_conversation(event)
             if fresh_cid != cid or (
                 not required and bridge.fingerprint(conv) != history_hash
             ):
@@ -1660,6 +1721,9 @@ class JevActiveReply(Star):
                 # A plugin stopping propagation is not a user recall. Preserve
                 # explicit cancellation flags, but finish an otherwise owed reply.
                 self._resume_required(event)
+                if event.get_extra("_jev_context_unavailable"):
+                    await self._context_failure_reply(event)
+                    return
                 if expired:
                     meta["created"] = time.monotonic()
                 flush = event.get_extra("_jev_flush_output")
@@ -1939,9 +2003,13 @@ class JevActiveReply(Star):
             self._reject(event, response, "duplicate_reply")
             return
         try:
-            cid, _ = await bridge.conversation(self.context, event)
+            cid, _ = await self._read_conversation(event)
         except Exception:
-            self._reject(event, response, "conversation_unavailable")
+            if required:
+                silence.clear_output(event, response)
+                await self._complete_output(event)
+            else:
+                self._reject(event, response, "conversation_unavailable")
             return
         if meta["cid"] and cid != meta["cid"]:
             self._reject(event, response, "conversation_changed")

@@ -58,7 +58,9 @@ async def test_output_fragments(env, native, texts, expected):
     ]
     if native and texts[-1] in ("。", ")") and texts[-2] in ("Next", "func("):
         # Native APIs complete immediately and return their platform receipt.
-        assert actual == ["Answer", texts[-2], texts[-1]]
+        assert actual == ["Answer", texts[-2]] + (
+            [texts[-1]] if texts[-1] != "。" else []
+        )
     else:
         assert actual == expected
     assert event.get_extra(MARK)["finished"]
