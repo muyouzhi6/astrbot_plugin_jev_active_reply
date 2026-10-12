@@ -21,10 +21,23 @@ ENDPOINTS = {
     "typesafe": ("https://api.typesafe.ai/v1/systemone", "jev-latest"),
     "nanbei": ("https://hajimi.165201.xyz/v1/systemone", "jev-latest"),
 }
+# The only judgment services: official, Nanbei, or a custom Jev-format relay.
+CHANNELS = ("typesafe", "nanbei", "custom")
+
+
+def channel_configured(config, kind: str) -> bool:
+    if kind == "custom":
+        relay = config.get("relay", {}) or {}
+        return bool(
+            str(relay.get("base_url") or "").strip()
+            and str(relay.get("api_key") or "").strip()
+        )
+    keys = (config.get(kind, {}) or {}).get("keys", [])
+    return isinstance(keys, list) and any(str(k).strip() for k in keys)
 
 
 def normalize_relay_url(base_url: str) -> str:
-    """Normalize OpenAI-compatible base URLs to chat completions."""
+    """Normalize a custom Jev-format relay base URL to its /v1/systemone endpoint."""
     value = str(base_url or "").strip().rstrip("/")
     try:
         parsed = urlsplit(value)
@@ -43,14 +56,12 @@ def normalize_relay_url(base_url: str) -> str:
     ):
         raise ValueError("relay base URL must be HTTPS without credentials/query")
     path = parsed.path.rstrip("/")
-    if path.endswith("/v1/chat/completions"):
-        path = path[: -len("/chat/completions")]
-    elif path.endswith("/chat/completions"):
-        path = path[: -len("/chat/completions")]
+    if path.endswith("/systemone"):
+        path = path[: -len("/systemone")]
     if path.endswith("/v1"):
         path = path[:-3]
     path = path.rstrip("/")
-    return f"{parsed.scheme}://{parsed.netloc}{path}/v1/chat/completions"
+    return f"{parsed.scheme}://{parsed.netloc}{path}/v1/systemone"
 
 
 class DecisionError(Exception):
@@ -83,11 +94,9 @@ class Adapter:
 
     @classmethod
     def create(cls, kind: str, config: dict) -> Adapter:
-        if kind == "relay":
+        if kind == "custom":
             endpoint = normalize_relay_url(config.get("base_url", ""))
-            model = str(config.get("model") or "").strip()
-            if not model:
-                raise ValueError("relay model is required")
+            model = str(config.get("model") or "").strip() or "jev-latest"
             return cls(kind, endpoint, model)
         if kind not in ENDPOINTS:
             raise ValueError("unknown channel type")
@@ -108,42 +117,10 @@ class Adapter:
         return cls(kind, endpoint, str(config.get("model") or model).strip())
 
     def encode(self, state: dict, questions: dict) -> dict:
-        # Both contracts currently share typed primitives, but not URL/aliases/errors.
-        if self.kind == "relay":
-            prompt = (
-                "根据下面的状态，严格回答每个问题的概率。只返回 JSON 对象，"
-                "键为问题名，值为 0 到 1 的数字，不要附加说明。\n"
-                + json.dumps(
-                    {"state": state, "questions": questions},
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-            )
-            return {
-                "model": self.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "response_format": {"type": "json_object"},
-            }
+        # Official, Nanbei and custom relays all speak the same systemone contract.
         return {"model": self.model, "state": state, "questions": questions}
 
     def decode(self, body: object, questions: dict) -> dict:
-        if self.kind == "relay":
-            try:
-                content = body["choices"][0]["message"]["content"]
-                decoded = json.loads(content) if isinstance(content, str) else content
-            except (KeyError, IndexError, TypeError, ValueError):
-                raise DecisionError("invalid_response") from None
-            body = {"answers": {}, "model": self.model}
-            if isinstance(decoded, dict):
-                for name, question in questions.items():
-                    value = decoded.get(name)
-                    if isinstance(value, dict):
-                        body["answers"][name] = value
-                    else:
-                        body["answers"][name] = {
-                            "type": question["type"],
-                            "noul": value,
-                        }
         if not isinstance(body, dict) or not isinstance(body.get("answers"), dict):
             raise DecisionError("invalid_response")
         values = {}
@@ -173,11 +150,7 @@ class Adapter:
         if not isinstance(error, dict):
             error = {}
         code = error.get("code") or error.get("type")
-        if (
-            self.kind != "relay"
-            and status == 403
-            and (not isinstance(body, dict) or code == "edge_blocked")
-        ):
+        if status == 403 and (not isinstance(body, dict) or code == "edge_blocked"):
             return "edge_rejected", 60, True
         if self.kind == "nanbei" and status == 403:
             return "site_access_or_balance", 60, True
@@ -342,19 +315,40 @@ class KeyPool:
 class JevClient:
     def __init__(self, config: dict, transport=None, clock=time.monotonic):
         self.config = config
-        relay_mode = config.get("relay_mode", "jev")
-        if relay_mode not in {"jev", "astrbot", "custom"}:
+        primary = config.get("relay_mode")
+        if primary in (None, "", "jev"):
+            # Unmigrated dicts: the old Jev mode used primary_channel.
+            primary = config.get("primary_channel") or "nanbei"
+        if primary not in CHANNELS:
             raise ValueError("invalid relay_mode")
-        primary = config.get("primary_channel", "nanbei")
-        if primary not in ENDPOINTS:
-            raise ValueError("invalid primary_channel")
-        self.order = [primary] if relay_mode == "jev" else []
-        if relay_mode == "custom" and config.get("allow_channel_fallback", False):
-            self.order = [primary]
-        if self.order and config.get("allow_channel_fallback", False):
-            self.order += [k for k in ENDPOINTS if k != primary]
+        self.order = [primary]
+        if config.get("allow_channel_fallback", False):
+            # Other Jev-format channels are optional backups, only when configured.
+            self.order += [
+                k for k in CHANNELS if k != primary and channel_configured(config, k)
+            ]
         self.pools = {}
+        self.config_errors = []
         for kind in self.order:
+            if kind == "custom":
+                relay = config.get("relay", {}) or {}
+                key = str(relay.get("api_key") or "").strip()
+                if channel_configured(config, kind):
+                    try:
+                        self.pools[kind] = KeyPool(
+                            kind,
+                            {
+                                **relay,
+                                "keys": [key],
+                                "concurrency": relay.get("concurrency", 4),
+                            },
+                            clock,
+                        )
+                    except ValueError:
+                        # An invalid custom URL must not stop the plugin from loading;
+                        # the channel just stays unavailable and status says so.
+                        self.config_errors.append(kind)
+                continue
             cfg = config.get(kind, {})
             groups = cfg.get("quota_group_ids", [])
             keys = cfg.get("keys", [])
@@ -393,37 +387,14 @@ class JevClient:
         self.revision = 0
         self.capacity_changed = asyncio.Event()
         self.group_cursor = 0
-        self.provider_slots = asyncio.Semaphore(4)
-        self.provider_waiters = 0
         for pool in self.pools.values():
             pool.changed = self._notify
-        relay = config.get("relay", {})
-        if relay_mode == "custom":
-            key = str(relay.get("api_key") or "").strip()
-            model = str(relay.get("model") or "").strip()
-            if not key or not model:
-                raise ValueError("custom relay requires an API key and model")
-            adapter = Adapter.create("relay", relay)
-            self.pools["relay"] = KeyPool(
-                "relay",
-                {
-                    **relay,
-                    "keys": [key],
-                    "concurrency": relay.get("concurrency", 4),
-                },
-                clock,
-            )
-            self.pools["relay"].adapter = adapter
-            self.pools["relay"].changed = self._notify
-            self.order.insert(0, "relay")
 
     def _notify(self):
         self.revision += 1
         self.capacity_changed.set()
 
     async def review_ready(self):
-        if self.config.get("relay_mode") == "astrbot":
-            return not self.closed
         for pool in self.pools.values():
             await pool.restore_health()
             if pool.adapter.kind not in self.order or pool.until > pool.clock():
@@ -532,7 +503,7 @@ class JevClient:
             json=payload,
             headers={
                 "Authorization": f"Bearer {key}",
-                "User-Agent": "JevActiveReply/0.10.0",
+                "User-Agent": "JevActiveReply/0.10.1",
             },
             allow_redirects=False,
         ) as response:
@@ -608,90 +579,14 @@ class JevClient:
             except DecisionError:
                 raise
             except Exception:
-                if pool.adapter.kind != "relay":
+                if pool.adapter.kind != "custom":
                     raise
+                # A third-party relay must never leak its exception text.
                 cooldown = 15
                 raise DecisionError("transport_uncertain") from None
             finally:
                 await pool.release(key, cooldown, shared)
         raise DecisionError("no_capacity")
-
-    async def evaluate_provider(self, state, questions, context, umo):
-        if self.closed:
-            raise DecisionError("client_closed")
-        try:
-            state = fit_state(state, questions, self.config)
-        except ValueError:
-            raise DecisionError("protected_context_exceeds_safety_budget") from None
-        adapter = Adapter("relay", "", "")
-        payload = adapter.encode(state, questions)
-        if len(json.dumps(payload, ensure_ascii=False).encode()) > self.max_body:
-            raise DecisionError("request_budget_exceeded")
-        if self.provider_waiters >= 64:
-            raise DecisionError("queue_full")
-        self.provider_waiters += 1
-        acquired = False
-        try:
-            queue_seconds = min(
-                10,
-                max(
-                    0,
-                    float(
-                        self.config.get(
-                            "review_queue_seconds"
-                            if "candidate_reply" in state
-                            else "decision_queue_seconds",
-                            4 if "candidate_reply" in state else 1,
-                        )
-                    ),
-                ),
-            )
-            if not self.provider_slots.locked():
-                await self.provider_slots.acquire()
-            else:
-                try:
-                    await asyncio.wait_for(self.provider_slots.acquire(), queue_seconds)
-                except asyncio.TimeoutError:
-                    raise DecisionError("no_capacity") from None
-            acquired = True
-            if self.closed:
-                raise DecisionError("client_closed")
-
-            async def generate():
-                provider_id = await context.get_current_chat_provider_id(umo=umo)
-                if not provider_id:
-                    raise DecisionError("provider_unavailable")
-                return await context.llm_generate(
-                    chat_provider_id=provider_id,
-                    prompt=payload["messages"][0]["content"],
-                    contexts=[],
-                    tools=None,
-                    response_format={"type": "json_object"},
-                )
-
-            try:
-                response = await asyncio.wait_for(generate(), self.timeout)
-            except DecisionError:
-                raise
-            except (asyncio.TimeoutError, aiohttp.ClientError):
-                raise DecisionError("transport_uncertain") from None
-            except Exception as exc:
-                status = getattr(exc, "status_code", None)
-                if isinstance(status, int):
-                    code, _, _ = adapter.classify(status, None, {})
-                    raise DecisionError(code, status) from None
-                raise DecisionError("provider_error") from None
-        finally:
-            self.provider_waiters -= 1
-            if acquired:
-                self.provider_slots.release()
-        text = str(getattr(response, "completion_text", "") or "")
-        if len(text.encode()) > 262144:
-            raise DecisionError("response_too_large")
-        result = adapter.decode(
-            {"choices": [{"message": {"content": text}}]}, questions
-        )
-        return {**result, "channel": "astrbot", "key_id": "provider"}
 
     async def close(self):
         self.closed = True

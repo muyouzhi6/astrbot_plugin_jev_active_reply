@@ -8,6 +8,13 @@ from pathlib import Path
 from datetime import datetime
 import tempfile
 
+try:
+    from astrbot.api import logger
+except Exception:  # pragma: no cover - only outside AstrBot
+    import logging
+
+    logger = logging.getLogger("astrbot")
+
 
 GROUPS = {
     "judgment": (
@@ -103,6 +110,50 @@ def migrate_groups(raw):
     return changed
 
 
+RELAY_MODES = ("typesafe", "nanbei", "custom")
+RELAY_CONFIG_VERSION = 1
+
+
+def migrate_relay(raw):
+    """0.10.1: one selector (relay_mode) for the three Jev-format services.
+
+    Old ``relay_mode=jev`` (or absent) takes the old ``primary_channel``; the
+    removed ``astrbot`` provider and OpenAI ``custom`` relay fall back to Nanbei.
+    """
+    if raw.get("_relay_config_version", 0) >= RELAY_CONFIG_VERSION:
+        return False
+    primary = raw.get("primary_channel")
+    if primary in ("mindshub", "mindshub_air"):
+        primary = "typesafe" if (raw.get("typesafe") or {}).get("keys") else "nanbei"
+    if primary not in ("typesafe", "nanbei"):
+        primary = "nanbei"
+    mode = raw.get("relay_mode")
+    if mode in (None, "", "jev"):
+        new = primary
+    elif mode in ("typesafe", "nanbei"):
+        new = mode
+    else:
+        new = "nanbei"
+        logger.warning(
+            "[JevActive] relay_mode=%s is no longer supported (Jev judgment only); "
+            "switched to 南北绿豆. Re-select the judgment service if needed.",
+            str(mode)[:20],
+        )
+    relay = raw.get("relay")
+    if isinstance(relay, dict) and any(relay.get(k) for k in ("base_url", "api_key")):
+        # The old relay section was OpenAI chat/completions; never send Jev
+        # systemone requests to it. The pre-migration file backup keeps it.
+        relay.update(base_url="", api_key="", model="jev-latest")
+        logger.warning(
+            "[JevActive] cleared the old OpenAI-format custom relay settings; "
+            "custom relays must now speak the Jev systemone protocol."
+        )
+    raw["relay_mode"] = new
+    raw.pop("primary_channel", None)
+    raw["_relay_config_version"] = RELAY_CONFIG_VERSION
+    return True
+
+
 def migrate_config_file(path):
     """Run before AstrBotConfig removes keys absent from the new schema."""
     path = Path(path)
@@ -110,7 +161,8 @@ def migrate_config_file(path):
         return
     original = path.read_bytes()
     raw = json.loads(original.decode("utf-8-sig"))
-    if not migrate_groups(raw):
+    changed = migrate_groups(raw)
+    if not migrate_relay(raw) and not changed:
         return
     backup = path.with_name(
         path.name + datetime.now().strftime(".%Y%m%d-%H%M%S-%f.bak")
@@ -138,11 +190,7 @@ class ConfigView(MutableMapping):
         self.raw = raw
         advanced = raw.get("advanced")
         changed = False
-        if raw.get("primary_channel") in ("mindshub", "mindshub_air"):
-            raw["primary_channel"] = (
-                "typesafe" if raw.get("typesafe", {}).get("keys") else "nanbei"
-            )
-            changed = True
+        changed = migrate_relay(raw) or changed
         for obsolete in ("mindshub", "mindshub_air"):
             if obsolete in raw:
                 del raw[obsolete]

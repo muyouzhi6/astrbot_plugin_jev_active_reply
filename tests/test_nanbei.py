@@ -19,15 +19,14 @@ def test_remove_old_credentials_for_every_primary(primary):
     config = ConfigView(raw)
     assert "mindshub" not in raw and "mindshub_air" not in raw
     assert "nanbei" not in raw
-    assert config["primary_channel"] == (
-        "nanbei" if primary == "nanbei" else "typesafe"
-    )
+    assert "primary_channel" not in raw
+    assert config["relay_mode"] == ("nanbei" if primary == "nanbei" else "typesafe")
 
 
 def test_legacy_without_official_key_stays_unconfigured():
     raw = {"primary_channel": "mindshub_air", "mindshub_air": {"keys": ["mdb_old"]}}
     ConfigView(raw)
-    assert raw["primary_channel"] == "nanbei"
+    assert raw["relay_mode"] == "nanbei" and "primary_channel" not in raw
     assert "nanbei" not in raw and "mindshub_air" not in raw
     assert raw["dry_run"] is False
 

@@ -327,10 +327,6 @@ class JevActiveReply(Star):
     async def _judge(self, event, state, questions):
         started, error = time.monotonic(), None
         try:
-            if self._cfg("relay_mode", "jev") == "astrbot":
-                return await self.client.evaluate_provider(
-                    state, questions, self.context, event.unified_msg_origin
-                )
             return await self.client.evaluate(state, questions)
         except asyncio.CancelledError:
             error = "cancelled"
@@ -2017,17 +2013,21 @@ class JevActiveReply(Star):
             await asyncio.shield(self.audit_task)
         pools = [pool.status() for pool in self.client.pools.values()]
         lines = [
-            "Jev 主动回复插件 0.10.0 · 木有知",
+            "Jev 主动回复插件 0.10.1 · 木有知",
             f"当前会话：{'已启用' if self._enabled(event) else '未启用'}",
         ]
-        if self._cfg("relay_mode", "jev") == "astrbot":
-            lines.append("判断服务：AstrBot 当前会话提供商")
+        names = {
+            "nanbei": "南北绿豆站",
+            "typesafe": "Jev 官方",
+            "custom": "自定义 Jev 中转",
+        }
+        lines.append(
+            "判断服务：" + names.get(self._cfg("relay_mode", "nanbei"), "未知")
+        )
+        if self.client.config_errors:
+            lines.append("自定义 Jev 中转地址无效，请检查 HTTPS Base URL。")
         for p in pools:
-            name = {
-                "nanbei": "南北绿豆站",
-                "typesafe": "Jev 官方",
-                "relay": "自定义中转",
-            }[p["channel"]]
+            name = names[p["channel"]]
             lines.append(
                 f"{name}：{p['keys']} 枚 Key，失效 {p['disabled_keys']} 枚，正在判断 {p['in_flight']} 次"
             )

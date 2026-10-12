@@ -13,21 +13,32 @@
   },
   "relay_mode": {
     "type": "string",
-    "default": "jev",
-    "options": ["jev", "astrbot", "custom"],
-    "labels": ["原有 Jev 渠道", "AstrBot 当前提供商", "自定义 OpenAI 中转"],
-    "description": "判断服务"
+    "default": "nanbei",
+    "options": [
+      "typesafe",
+      "nanbei",
+      "custom"
+    ],
+    "labels": [
+      "Jev 官方",
+      "南北绿豆（推荐）",
+      "自定义 Jev 格式中转"
+    ],
+    "description": "判断服务",
+    "hint": "只用 Jev 判断。自定义中转须是 Jev systemone 协议（不是 OpenAI chat/completions）。开启渠道互备时，其余已填 Key 的服务作为备用。"
   },
   "relay": {
     "type": "object",
-    "description": "自定义判断中转",
-    "condition": {"relay_mode": "custom"},
+    "description": "自定义 Jev 格式中转",
+    "condition": {
+      "relay_mode": "custom"
+    },
     "items": {
       "base_url": {
         "type": "string",
         "default": "",
         "description": "HTTPS Base URL",
-        "hint": "可填写站点地址、带 /v1 的地址或完整 /v1/chat/completions 地址。"
+        "hint": "可填站点地址、带 /v1 的地址或完整 /v1/systemone 地址。"
       },
       "api_key": {
         "type": "string",
@@ -37,7 +48,7 @@
       },
       "model": {
         "type": "string",
-        "default": "",
+        "default": "jev-latest",
         "description": "模型"
       },
       "concurrency": {
@@ -59,20 +70,6 @@
     "description": "启用会话",
     "hint": "填写群号、私聊用户号或完整会话标识；填 * 表示全部。私聊需打开私聊开关。",
     "invisible": false
-  },
-  "primary_channel": {
-    "type": "string",
-    "default": "nanbei",
-    "options": [
-      "nanbei",
-      "typesafe"
-    ],
-    "description": "Jev 服务",
-    "invisible": false,
-    "labels": [
-      "南北绿豆站（推荐）",
-      "Jev 官方"
-    ]
   },
   "nanbei": {
     "type": "object",
@@ -131,7 +128,7 @@
     },
     "invisible": false,
     "condition": {
-      "primary_channel": "nanbei"
+      "relay_mode": "nanbei"
     }
   },
   "typesafe": {
@@ -191,7 +188,7 @@
     },
     "invisible": false,
     "condition": {
-      "primary_channel": "typesafe"
+      "relay_mode": "typesafe"
     }
   },
   "style": {
@@ -843,6 +840,12 @@
     "default": false,
     "description": "首选池无容量时允许使用另一渠道",
     "hint": "只在请求发出前选择渠道；发出后失败不自动重发。官方可能收费。",
+    "invisible": true
+  },
+  "_relay_config_version": {
+    "type": "int",
+    "default": 0,
+    "description": "判断服务配置版本",
     "invisible": true
   }
 }

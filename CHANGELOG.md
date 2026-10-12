@@ -1,11 +1,18 @@
 # 更新记录
 
+## 0.10.1 · 2026-10-12
+
+- 只用 Jev 判断：`relay_mode` 改为唯一的判断服务选择，三选一 `typesafe`（Jev 官方）/ `nanbei`（南北绿豆，默认）/ `custom`（自定义 Jev 格式中转，`systemone` 协议，模型默认 `jev-latest`）。
+- 移除 AstrBot 提供商判断与 OpenAI 格式自定义中转；`primary_channel` 并入 `relay_mode`。
+- 旧配置自动迁移：`jev` 取原主渠道；`astrbot`/OpenAI `custom` 改为南北绿豆并记录警告。互备仅加入已填凭据的其他 Jev 服务。
+- 第三方运行器（Dify/Coze 等）开启接管时保留原生回复，兼容 4.28.2 与 4.26.8 两种配置形状。
+
 ## 0.10.0 · 2026-10-12
 
 - 新增 `takeover_wake_messages=false`，可将 @、昵称、引用 Bot 与唤醒前缀交给 Jev 判断；命令仍由 AstrBot 路由和检查权限。
 - 新增 `enable_private_chat=false`，私聊支持会话白名单、黑名单、静音与连续消息合并。
 - 点名与私聊复用原合批、取消和发送保护；替换或拒绝时停止事件，通过后使用一次原生生成链，合批保留呼叫语义与附件。
-- 新增 `relay_mode=jev/astrbot/custom`，默认继续原渠道；可使用 AstrBot 当前会话 provider 或自定义 OpenAI 兼容中转。
+- 新增 `relay_mode=jev/astrbot/custom`（0.10.1 已改为 Jev 三选一）。
 - 自定义中转支持 HTTPS 地址规范化、独立凭据、并发槽位、复查优先、超时、错误分类和显式渠道互备；配置页使用 AstrBot 支持的 `secret` 标记。
 - 每小时统计将合批取消与失败分开，补充失败分类及结果计数，按小时清零；既有阈值、渠道默认值与生效配置保持原样。
 - 增加点名/私聊并发、命令路由、原生尾部单次生成、中转 HTTP 与旧配置兼容测试；兼容范围保持 `>=4.26.8,<5`。

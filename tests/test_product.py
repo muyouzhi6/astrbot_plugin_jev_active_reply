@@ -19,14 +19,20 @@ def test_dashboard_only_selected_channel_needs_configuration(kind):
     visible = [
         name
         for name in ("nanbei", "typesafe")
-        if schema[name]["condition"] == {"primary_channel": kind}
+        if schema[name]["condition"] == {"relay_mode": kind}
     ]
     assert visible == [kind]
     fields = schema[kind]["items"]
     assert [name for name, field in fields.items() if not field.get("invisible")] == [
         "keys"
     ]
-    assert schema["primary_channel"]["labels"] == ["南北绿豆站（推荐）", "Jev 官方"]
+    assert "primary_channel" not in schema
+    assert schema["relay_mode"]["options"] == ["typesafe", "nanbei", "custom"]
+    assert schema["relay_mode"]["labels"] == [
+        "Jev 官方",
+        "南北绿豆（推荐）",
+        "自定义 Jev 格式中转",
+    ]
     assert schema["dry_run"]["invisible"] and schema["dry_run"]["default"] is False
 
 
@@ -100,7 +106,11 @@ def test_patch_removes_only_legacy_duplicates_and_preserves_effective_values():
     first = {k: before[k] for k in before if k not in excluded}
     second = {k: after[k] for k in after if k not in excluded}
     # Frozen expected values were evaluated by the pre-0.9.0 parser.
-    assert first == second == fixture["effective"]
+    expected = dict(fixture["effective"])
+    # 0.10.1 folds primary_channel into the single relay_mode selector.
+    expected["relay_mode"] = expected.pop("primary_channel")
+    expected["_relay_config_version"] = 1
+    assert first == second == expected
     assert set(patch["set"]) == {"advanced.context.interest_topics"}
     assert set(patch["delete_top_level"]) == {
         "timeout_seconds",

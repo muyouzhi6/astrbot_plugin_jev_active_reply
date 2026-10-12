@@ -1,26 +1,25 @@
-"""OpenAI-compatible judging, safe errors and legacy channel isolation."""
+"""0.10.1: Jev-only judgment (official / Nanbei / custom Jev-format relay)."""
 
 import asyncio
 import json
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock
 
 import pytest
 from aiohttp import web
-from astrbot.core.provider.entities import LLMResponse
 
 from ..client import Adapter, DecisionError, JevClient, normalize_relay_url
 from ..policy import QUESTIONS, REVIEW_QUESTIONS
-from ..settings import ConfigView
+from ..settings import ConfigView, migrate_config_file
 from ..telemetry import Metrics
 from . import test_v020 as previous
 from . import test_integration as base
 from .test_client import answer
 
 env = previous.env
+ROOT = Path(__file__).parents[1]
 
 
 def config(**extra):
@@ -29,40 +28,30 @@ def config(**extra):
         "relay": {
             "base_url": "https://relay.example",
             "api_key": "synthetic-secret",
-            "model": "test-model",
+            "model": "",
             "concurrency": 2,
         },
         **extra,
     }
 
 
-def completion(questions=QUESTIONS):
+def jev_answer(questions=QUESTIONS, value=0.9):
     return {
-        "choices": [
-            {"message": {"content": json.dumps({name: 0.9 for name in questions})}}
-        ]
+        "answers": {
+            name: {"type": q["type"], "noul": value} for name, q in questions.items()
+        },
+        "model": "jev-latest",
     }
 
 
 @pytest.mark.parametrize(
-    "suffix",
-    [
-        "",
-        "/",
-        "/v1",
-        "/v1/",
-        "/v1/chat/completions",
-        "/v1/chat/completions/",
-        "/chat/completions/",
-    ],
+    "suffix", ["", "/", "/v1", "/v1/", "/v1/systemone", "/v1/systemone/", "/systemone"]
 )
 @pytest.mark.parametrize(
     "base", ["https://relay.example", "https://relay.example:8443/proxy"]
 )
 def test_base_url_normalization(base, suffix):
-    assert (
-        normalize_relay_url(" " + base + suffix + " ") == base + "/v1/chat/completions"
-    )
+    assert normalize_relay_url(" " + base + suffix + " ") == base + "/v1/systemone"
 
 
 @pytest.mark.parametrize(
@@ -89,29 +78,38 @@ def test_invalid_base_url_has_safe_error(value):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("questions", [QUESTIONS, REVIEW_QUESTIONS])
-async def test_custom_wire_and_review_share_pool(questions):
-    wire = AsyncMock(return_value=(200, {}, completion(questions)))
+async def test_custom_speaks_jev_systemone_protocol(questions):
+    wire = AsyncMock(return_value=(200, {}, jev_answer(questions)))
     client = JevClient(config(), transport=wire)
-    result = await client.evaluate(
-        {"candidate_reply": "合成草稿"} if questions == REVIEW_QUESTIONS else {},
-        questions,
-    )
+    state = {"candidate_reply": "合成草稿"} if questions == REVIEW_QUESTIONS else {}
+    result = await client.evaluate(state, questions)
     endpoint, key, payload = wire.await_args.args
-    assert endpoint == "https://relay.example/v1/chat/completions"
+    assert endpoint == "https://relay.example/v1/systemone"
     assert key == "synthetic-secret"
-    assert payload["model"] == "test-model" and payload["response_format"] == {
-        "type": "json_object"
+    # Same wire shape as the official adapters: no OpenAI messages.
+    assert set(payload) == {"model", "state", "questions"}
+    assert payload["model"] == "jev-latest" and payload["questions"] == questions
+    assert payload["state"].items() >= state.items()
+    assert result["channel"] == "custom"
+    assert result["values"] == dict.fromkeys(questions, 0.9)
+    assert "synthetic-secret" not in repr(result)
+    assert client.pools["custom"].active == 0
+    await client.close()
+
+
+def test_custom_wire_matches_official_adapter():
+    official = Adapter.create("typesafe", {})
+    custom = Adapter.create(
+        "custom", {"base_url": "https://relay.example", "model": "m"}
+    )
+    assert official.encode({"a": 1}, QUESTIONS) == {
+        **custom.encode({"a": 1}, QUESTIONS),
+        "model": "jev-latest",
     }
     assert (
-        json.loads(payload["messages"][0]["content"].split("\n", 1)[1])["questions"]
-        == questions
+        custom.decode(jev_answer(), QUESTIONS)["values"]
+        == official.decode(jev_answer(), QUESTIONS)["values"]
     )
-    assert result["channel"] == "relay" and result["values"] == dict.fromkeys(
-        questions, 0.9
-    )
-    assert "synthetic-secret" not in repr(result)
-    assert client.pools["relay"].active == 0
-    await client.close()
 
 
 @pytest.mark.asyncio
@@ -128,7 +126,7 @@ async def test_custom_wire_and_review_share_pool(questions):
         (302, "http_error"),
     ],
 )
-async def test_relay_error_classes_and_safe_logs(status, expected, caplog):
+async def test_custom_error_classes_and_safe_logs(status, expected, caplog):
     transport = AsyncMock(
         return_value=(
             status,
@@ -142,10 +140,10 @@ async def test_relay_error_classes_and_safe_logs(status, expected, caplog):
             await client.evaluate({}, QUESTIONS)
         assert error.value.code == expected and error.value.status == status
         assert "synthetic-secret" not in str(error.value) + caplog.text + repr(
-            client.pools["relay"].keys
+            client.pools["custom"].keys
         )
         transport.assert_awaited_once()
-        assert client.pools["relay"].active == 0
+        assert client.pools["custom"].active == 0
     finally:
         await client.close()
 
@@ -157,7 +155,7 @@ async def test_timeout_never_replayed_and_releases_slot():
     with pytest.raises(DecisionError, match="transport_uncertain"):
         await client.evaluate({}, QUESTIONS)
     wire.assert_awaited_once()
-    assert client.pools["relay"].active == 0
+    assert client.pools["custom"].active == 0
     await client.close()
 
 
@@ -166,67 +164,169 @@ async def test_timeout_never_replayed_and_releases_slot():
     [
         None,
         {},
-        {"choices": []},
-        {"choices": [{"message": {"content": "not json synthetic-secret"}}]},
-        {"choices": [{"message": {"content": "[]"}}]},
+        {"choices": [{"message": {"content": "{}"}}]},
+        {"answers": []},
+        {"answers": {}},
     ],
 )
-def test_malformed_completion_is_safe(body):
-    with pytest.raises(DecisionError) as error:
-        Adapter.create("relay", config()["relay"]).decode(body, QUESTIONS)
-    assert "synthetic-secret" not in str(error.value)
+def test_non_jev_response_is_rejected_safely(body):
+    with pytest.raises(DecisionError):
+        Adapter.create("custom", config()["relay"]).decode(body, QUESTIONS)
 
 
 @pytest.mark.asyncio
-async def test_custom_falls_back_only_when_enabled_with_own_channel_keys():
+@pytest.mark.parametrize("primary", ["typesafe", "nanbei", "custom"])
+async def test_selected_service_primary_others_only_as_configured_fallback(primary):
+    full = config(
+        relay_mode=primary,
+        allow_channel_fallback=True,
+        nanbei={"keys": ["site-test"]},
+        typesafe={"keys": ["apikey_test"]},
+    )
+    client = JevClient(full)
+    assert client.order[0] == primary
+    assert sorted(client.order) == ["custom", "nanbei", "typesafe"]
+    await client.close()
+    # Without fallback only the selected service is used.
+    alone = JevClient({**full, "allow_channel_fallback": False})
+    assert alone.order == [primary]
+    await alone.close()
+    # Fallback never adds services that have no credentials.
+    sparse = JevClient(
+        {"relay_mode": primary, "allow_channel_fallback": True, **{primary: {}}}
+    )
+    assert sparse.order == [primary]
+    await sparse.close()
+
+
+@pytest.mark.asyncio
+async def test_custom_falls_back_to_nanbei_on_explicit_rejection():
     cfg = config(
         allow_channel_fallback=True,
         retry_explicit_rejection=True,
-        primary_channel="nanbei",
         nanbei={"keys": ["site-test"]},
-        typesafe={"keys": ["official-test"]},
     )
     wire = AsyncMock(side_effect=[(401, {}, {}), (200, {}, answer())])
     client = JevClient(cfg, transport=wire)
     result = await client.evaluate({}, QUESTIONS)
-    assert client.order == ["relay", "nanbei", "typesafe"]
+    assert client.order == ["custom", "nanbei"]
     assert result["channel"] == "nanbei"
-    assert [call.args[1] for call in wire.await_args_list] == [
+    assert [c.args[1] for c in wire.await_args_list] == [
         "synthetic-secret",
         "site-test",
     ]
     await client.close()
-    isolated = JevClient(config(nanbei={"keys": ["site-test"]}))
-    assert isolated.order == ["relay"] and list(isolated.pools) == ["relay"]
-    await isolated.close()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("fallback", [True, False])
-async def test_legacy_configuration_without_new_fields_keeps_pool_behavior(fallback):
+async def test_unconfigured_or_invalid_custom_never_breaks_loading():
+    empty = JevClient({"relay_mode": "custom"})
+    assert empty.order == ["custom"] and not empty.pools
+    assert not await empty.review_ready()
+    with pytest.raises(DecisionError, match="no_capacity"):
+        await empty.evaluate({}, QUESTIONS)
+    await empty.close()
+    bad = JevClient(
+        {"relay_mode": "custom", "relay": {"base_url": "http://x", "api_key": "k"}}
+    )
+    assert bad.config_errors == ["custom"] and not bad.pools
+    await bad.close()
+
+
+@pytest.mark.parametrize("mode", ["astrbot", "jev", "openai", 3])
+def test_removed_modes_rejected_by_client_unless_migrated(mode):
+    if mode == "jev":
+        client = JevClient({"relay_mode": "jev", "primary_channel": "typesafe"})
+        assert client.order == ["typesafe"]
+        return
+    with pytest.raises(ValueError):
+        JevClient({"relay_mode": mode})
+
+
+def test_no_provider_or_openai_path_remains():
+    source = (ROOT / "client.py").read_text() + (ROOT / "main.py").read_text()
+    # llm_generate remains only for the pre-existing overflow summary, not judging.
+    for gone in (
+        "evaluate_provider",
+        "chat/completions",
+        '"astrbot"',
+        "provider_slots",
+    ):
+        assert gone not in source
+
+
+@pytest.mark.parametrize(
+    "old,expected,cleared",
+    [
+        ({"relay_mode": "jev", "primary_channel": "typesafe"}, "typesafe", False),
+        ({"relay_mode": "jev", "primary_channel": "nanbei"}, "nanbei", False),
+        ({"primary_channel": "typesafe"}, "typesafe", False),
+        ({}, "nanbei", False),
+        ({"relay_mode": "jev", "primary_channel": "mindshub"}, "nanbei", False),
+        ({"relay_mode": "astrbot", "primary_channel": "typesafe"}, "nanbei", False),
+        (
+            {
+                "relay_mode": "custom",
+                "primary_channel": "typesafe",
+                "relay": {
+                    "base_url": "https://openai.example/v1",
+                    "api_key": "sk-old",
+                    "model": "gpt-x",
+                    "concurrency": 3,
+                },
+            },
+            "nanbei",
+            True,
+        ),
+    ],
+)
+def test_migration_to_single_selector(old, expected, cleared, caplog):
+    raw = deepcopy(old)
+    view = ConfigView(raw)
+    assert raw["relay_mode"] == view["relay_mode"] == expected
+    assert "primary_channel" not in raw and raw["_relay_config_version"] == 1
+    if old.get("relay_mode") in ("astrbot", "custom"):
+        assert "no longer supported" in caplog.text
+    if cleared:
+        assert raw["relay"] == {
+            "base_url": "",
+            "api_key": "",
+            "model": "jev-latest",
+            "concurrency": 3,
+        }
+        assert "sk-old" not in caplog.text
+    JevClient(view)
+
+
+def test_migration_runs_once_and_keeps_new_custom_choice():
     raw = {
-        "_product_config_version": 1,
-        "primary_channel": "typesafe",
-        "allow_channel_fallback": fallback,
-        "typesafe": {"keys": ["official-test"]},
-        "nanbei": {"keys": ["site-test"]},
-        "style": "quiet",
-        "enabled_sessions": ["group"],
+        "_relay_config_version": 1,
+        "relay_mode": "custom",
+        "relay": {"base_url": "https://jev-relay.example", "api_key": "k"},
     }
     before = deepcopy(raw)
     view = ConfigView(raw)
-    client = JevClient(view)
-    assert client.order == (["typesafe", "nanbei"] if fallback else ["typesafe"])
-    assert not view.get("takeover_wake_messages", False) and not view.get(
-        "enable_private_chat", False
+    assert {k: raw[k] for k in before} == before
+    assert view["relay_mode"] == "custom"
+
+
+def test_file_migration_runs_before_schema_strips_primary_channel(tmp_path):
+    path = tmp_path / "jev_config.json"
+    path.write_text(
+        "\ufeff" + json.dumps({"relay_mode": "jev", "primary_channel": "typesafe"}),
+        encoding="utf-8",
     )
-    for key in before:
-        assert view[key] == before[key]
-    await client.close()
+    migrate_config_file(path)
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    assert data["relay_mode"] == "typesafe" and "primary_channel" not in data
+    assert list(tmp_path.glob("jev_config.json.*.bak"))
+    stat = path.stat()
+    migrate_config_file(path)
+    assert path.stat().st_mtime_ns == stat.st_mtime_ns
 
 
 @pytest.mark.asyncio
-async def test_real_http_relay_non_json_auth_and_no_key_logging(caplog):
+async def test_real_http_custom_relay_non_json_auth_and_no_key_logging(caplog):
     seen = []
     behavior = {"status": 200, "json": True}
 
@@ -236,10 +336,10 @@ async def test_real_http_relay_non_json_auth_and_no_key_logging(caplog):
         )
         if not behavior["json"]:
             return web.Response(text="synthetic-secret", status=behavior["status"])
-        return web.json_response(completion(), status=behavior["status"])
+        return web.json_response(jev_answer(), status=behavior["status"])
 
     app = web.Application()
-    app.router.add_post("/v1/chat/completions", handler)
+    app.router.add_post("/v1/systemone", handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -254,9 +354,9 @@ async def test_real_http_relay_non_json_auth_and_no_key_logging(caplog):
         ]:
             behavior.update(status=status, json=is_json)
             client = JevClient(config())
-            pool = client.pools["relay"]
+            pool = client.pools["custom"]
             pool.adapter = replace(
-                pool.adapter, endpoint=f"http://127.0.0.1:{port}/v1/chat/completions"
+                pool.adapter, endpoint=f"http://127.0.0.1:{port}/v1/systemone"
             )
             try:
                 if expected:
@@ -268,83 +368,34 @@ async def test_real_http_relay_non_json_auth_and_no_key_logging(caplog):
                 await client.close()
         assert len(seen) == 4
         assert all(
-            path == "/v1/chat/completions" and key == "Bearer synthetic-secret"
-            for path, key, _ in seen
+            path == "/v1/systemone"
+            and key == "Bearer synthetic-secret"
+            and set(body) == {"model", "state", "questions"}
+            for path, key, body in seen
         )
         assert "synthetic-secret" not in caplog.text
     finally:
         await runner.cleanup()
 
 
-@pytest.mark.asyncio
-async def test_astrbot_provider_selection_and_timeout(env):
-    env.cfg["relay_mode"] = "astrbot"
-    env.ctx.get_current_chat_provider_id = AsyncMock(return_value="session-provider")
-    env.ctx.llm_generate = AsyncMock(
-        return_value=LLMResponse(
-            role="assistant", completion_text=json.dumps(dict.fromkeys(QUESTIONS, 0.8))
-        )
-    )
-    ev = base.event()
-    result = await env.plugin._judge(ev, {}, QUESTIONS)
-    assert result["channel"] == "astrbot"
-    env.ctx.get_current_chat_provider_id.assert_awaited_once_with(
-        umo=ev.unified_msg_origin
-    )
-    assert (
-        env.ctx.llm_generate.await_args.kwargs["chat_provider_id"] == "session-provider"
-    )
-    assert env.ctx.llm_generate.await_args.kwargs["tools"] is None
-    env.plugin.client.evaluate.assert_not_awaited()
-    env.ctx.get_current_chat_provider_id.side_effect = asyncio.TimeoutError()
-    with pytest.raises(DecisionError, match="transport_uncertain"):
-        await env.plugin._judge(ev, {}, QUESTIONS)
-    assert env.plugin.client.provider_waiters == 0
-    assert env.plugin.client.provider_slots._value == 4
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "status,expected",
-    [
-        (401, "auth_disabled"),
-        (429, "rate_limited"),
-        (500, "upstream_error"),
-        (None, "provider_error"),
-    ],
-)
-async def test_astrbot_provider_classifies_errors_without_exception_text(
-    status, expected
-):
-    error = RuntimeError("synthetic-secret")
-    error.status_code = status
-    context = NS(
-        get_current_chat_provider_id=AsyncMock(return_value="test"),
-        llm_generate=AsyncMock(side_effect=error),
-    )
-    client = JevClient({"relay_mode": "astrbot"})
-    with pytest.raises(DecisionError, match=expected) as captured:
-        await client.evaluate_provider(
-            {}, QUESTIONS, context, "test:FriendMessage:human"
-        )
-    assert "synthetic-secret" not in str(captured.value)
-    assert not client.pools
-    await client.close()
-
-
 def test_new_config_defaults_and_secret_schema():
-    schema = json.loads((Path(__file__).parents[1] / "_conf_schema.json").read_text())
+    schema = json.loads((ROOT / "_conf_schema.json").read_text(encoding="utf-8-sig"))
     assert schema["takeover_wake_messages"]["default"] is False
     assert schema["enable_private_chat"]["default"] is False
-    assert schema["relay_mode"]["default"] == "jev"
+    assert schema["relay_mode"]["default"] == "nanbei"
+    assert schema["relay_mode"]["options"] == ["typesafe", "nanbei", "custom"]
+    assert "primary_channel" not in schema
+    assert schema["_relay_config_version"]["invisible"] is True
     fields = schema["relay"]["items"]
     assert {k: v["default"] for k, v in fields.items()} == {
         "base_url": "",
         "api_key": "",
-        "model": "",
+        "model": "jev-latest",
         "concurrency": 4,
     }
     assert fields["api_key"]["secret"] is True and fields["api_key"]["type"] == "string"
+    text = json.dumps(schema, ensure_ascii=False)
+    assert "OpenAI 中转" not in text and "AstrBot 当前提供商" not in text
 
 
 def test_cancelled_calls_are_separate_from_errors_and_every_hour_resets():
@@ -382,11 +433,10 @@ async def test_custom_concurrency_queue_cancellation_and_review_priority():
     order = []
 
     async def wire(endpoint, key, payload):
-        data = json.loads(payload["messages"][0]["content"].split("\n", 1)[1])
-        order.append("review" if "candidate_reply" in data["state"] else "gate")
+        order.append("review" if "candidate_reply" in payload["state"] else "gate")
         entered.set()
         await finish.wait()
-        return 200, {}, completion(data["questions"])
+        return 200, {}, jev_answer(payload["questions"])
 
     cfg = config(decision_queue_seconds=2, review_queue_seconds=2)
     cfg["relay"]["concurrency"] = 1
@@ -398,11 +448,11 @@ async def test_custom_concurrency_queue_cancellation_and_review_priority():
         client.evaluate({"candidate_reply": "synthetic"}, REVIEW_QUESTIONS)
     )
     await asyncio.sleep(0.01)
-    assert client.pools["relay"].active == 1
+    assert client.pools["custom"].active == 1
     finish.set()
     await asyncio.gather(first, gate, review)
     assert order == ["gate", "review", "gate"]
-    assert client.pools["relay"].active == 0 and not client.waiters
+    assert client.pools["custom"].active == 0 and not client.waiters
     entered.clear()
     finish.clear()
     task = asyncio.create_task(client.evaluate({}, QUESTIONS))
@@ -410,81 +460,23 @@ async def test_custom_concurrency_queue_cancellation_and_review_priority():
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert client.pools["relay"].active == 0 and not client.waiters
-    await client.close()
-
-
-@pytest.mark.asyncio
-async def test_provider_real_context_api_and_capacity_queue():
-    from astrbot.core.star.context import Context
-    from astrbot.core.provider.provider import Provider
-    from unittest.mock import Mock
-
-    provider = Mock(spec=Provider)
-    provider.text_chat = AsyncMock(
-        return_value=LLMResponse(
-            role="assistant", completion_text=json.dumps(dict.fromkeys(QUESTIONS, 0.8))
-        )
-    )
-    ctx = NS(
-        provider_manager=NS(get_provider_by_id=AsyncMock(return_value=provider)),
-        get_current_chat_provider_id=AsyncMock(return_value="selected"),
-    )
-    ctx.llm_generate = Context.llm_generate.__get__(ctx)
-    client = JevClient({"relay_mode": "astrbot", "decision_queue_seconds": 0})
-    result = await client.evaluate_provider(
-        {}, QUESTIONS, ctx, "test:FriendMessage:human"
-    )
-    assert result["values"] == dict.fromkeys(QUESTIONS, 0.8)
-    assert provider.text_chat.await_args.kwargs["func_tool"] is None
-    for _ in range(4):
-        await client.provider_slots.acquire()
-    with pytest.raises(DecisionError, match="no_capacity"):
-        await client.evaluate_provider({}, QUESTIONS, ctx, "test:FriendMessage:human")
-    for _ in range(4):
-        client.provider_slots.release()
-    assert client.provider_waiters == 0
-    await client.close()
-    with pytest.raises(DecisionError, match="client_closed"):
-        await client.evaluate_provider({}, QUESTIONS, ctx, "test:FriendMessage:human")
-
-
-@pytest.mark.asyncio
-async def test_provider_cancellation_releases_capacity():
-    entered = asyncio.Event()
-
-    async def generate(**kwargs):
-        entered.set()
-        await asyncio.Event().wait()
-
-    ctx = NS(
-        get_current_chat_provider_id=AsyncMock(return_value="selected"),
-        llm_generate=generate,
-    )
-    client = JevClient({"relay_mode": "astrbot"})
-    task = asyncio.create_task(client.evaluate_provider({}, QUESTIONS, ctx, "session"))
-    await entered.wait()
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert client.provider_slots._value == 4 and client.provider_waiters == 0
+    assert client.pools["custom"].active == 0 and not client.waiters
     await client.close()
 
 
 @pytest.mark.parametrize(
     "value", [True, False, -0.1, 1.1, float("nan"), float("inf"), None, "0.8"]
 )
-def test_relay_rejects_non_probability_values(value):
-    body = completion()
-    body["choices"][0]["message"]["content"] = json.dumps(
-        dict.fromkeys(QUESTIONS, value)
-    )
+def test_custom_rejects_non_probability_values(value):
+    body = jev_answer()
+    for answer_ in body["answers"].values():
+        answer_["noul"] = value
     with pytest.raises(DecisionError, match="invalid_probability"):
-        Adapter.create("relay", config()["relay"]).decode(body, QUESTIONS)
+        Adapter.create("custom", config()["relay"]).decode(body, QUESTIONS)
 
 
 @pytest.mark.asyncio
-async def test_unexpected_relay_exception_is_redacted_and_never_retried(caplog):
+async def test_unexpected_custom_exception_is_redacted_and_never_retried(caplog):
     wire = AsyncMock(side_effect=RuntimeError("synthetic-secret"))
     client = JevClient(config(retry_explicit_rejection=True), transport=wire)
     try:
@@ -497,7 +489,7 @@ async def test_unexpected_relay_exception_is_redacted_and_never_retried(caplog):
 
 
 @pytest.mark.asyncio
-async def test_relay_budget_rejects_before_network():
+async def test_custom_budget_rejects_before_network():
     wire = AsyncMock()
     client = JevClient(config(request_byte_budget=8000), transport=wire)
     try:
@@ -508,3 +500,12 @@ async def test_relay_budget_rejects_before_network():
         wire.assert_not_awaited()
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_status_names_selected_service_without_keys(env):
+    env.cfg["relay_mode"] = "nanbei"
+    ev = base.event()
+    lines = [r async for r in env.plugin.status(ev)]
+    text = str(lines)
+    assert "判断服务：南北绿豆站" in text and "AstrBot" not in text

@@ -4,7 +4,7 @@
 
 Jev 负责快速判断是否值得接话，真正的回复仍由你给 AstrBot 配置的主模型生成。人设、上下文、记忆和图片继续走原有链路，不需要在这里重新配一套。
 
-**作者：木有知 · 版本：0.10.0 · AstrBot 4.26.8+（低于 5.0）· aiocqhttp 群聊与可选私聊**
+**作者：木有知 · 版本：0.10.1 · AstrBot 4.26.8+（低于 5.0）· aiocqhttp 群聊与可选私聊**
 
 ## 三步开始
 
@@ -43,39 +43,33 @@ Jev 负责快速判断是否值得接话，真正的回复仍由你给 AstrBot �
 - AstrBot 已识别的插件命令、内置命令及其别名继续交给原命令处理器，权限仍由 AstrBot 检查。
 - 群聊点名和私聊都沿用现有合并窗口、同人相关补充判定、图片附件保护与发送检查。开启接管后，连续点名进入合并流程；已经开始发送的轮次继续完成投递。
 
-## AstrBot 提供商与自定义中转
+## 判断服务
 
-`relay_mode` 选择**判断服务**；最终回复仍由 AstrBot 当前会话的主模型生成，继续使用现有人设、记忆、图片和上下文。
+本插件只用 Jev 判断，不用大模型判断。`relay_mode` 是唯一的**判断服务**选择；最终回复仍由 AstrBot 当前会话的主模型生成，继续使用现有人设、记忆、图片和上下文。
 
 | 配置项 | 默认值 | 用途 |
 |---|---|---|
 | `takeover_wake_messages` | `false` | 接管群聊点名与前缀呼叫 |
 | `enable_private_chat` | `false` | 开启私聊判断与合并 |
-| `relay_mode` | `jev` | `jev` 原有渠道；`astrbot` 当前会话提供商；`custom` 自定义 OpenAI 兼容中转 |
-| `relay.base_url` | 空字符串 | 自定义中转的 HTTPS 地址 |
-| `relay.api_key` | 空字符串 | 自定义中转凭据 |
-| `relay.model` | 空字符串 | 自定义中转模型名 |
+| `relay_mode` | `nanbei` | `typesafe` Jev 官方；`nanbei` 南北绿豆；`custom` 自定义 Jev 格式中转 |
+| `relay.base_url` | 空字符串 | 自定义 Jev 中转的 HTTPS 地址 |
+| `relay.api_key` | 空字符串 | 自定义 Jev 中转凭据 |
+| `relay.model` | `jev-latest` | 自定义 Jev 中转模型名 |
 | `relay.concurrency` | `4` | 自定义中转并发数，取值 1–20 |
 
-`jev` 模式保留原渠道池、多 Key、配额分组与互备逻辑。`astrbot` 模式直接使用当前会话选中的 provider 判断，连接并发为 4，不需要在本插件重复填 Key。`custom` 模式填写中转地址、Key 和模型，使用 `/v1/chat/completions` 和 JSON 概率结果。
-
-以下地址等价，末尾斜杠会规范化：
+自定义中转必须讲 Jev 原生 `systemone` 协议（请求 `model/state/questions`，返回 `answers`），与官方和南北绿豆完全相同；不是 OpenAI `chat/completions`。以下地址等价：
 
 ```text
 https://relay.example
-https://relay.example/
 https://relay.example/v1
-https://relay.example/v1/
-https://relay.example/v1/chat/completions
+https://relay.example/v1/systemone
 ```
 
-带路径的地址如 `https://relay.example/proxy/v1` 会保留 `/proxy`。地址使用 HTTPS；凭据填在 Key 字段，不放入 URL 用户信息或查询参数。AstrBot 4.28.2 配置页通过 `secret` 字段隐藏 Key，可点眼睛图标查看；4.26.8 配置页将该字段显示为普通文本。
+带路径的地址如 `https://relay.example/proxy/v1` 会保留 `/proxy`。地址使用 HTTPS；凭据填在 Key 字段，不放入 URL。地址无效时插件照常加载，`jev状态` 会提示检查地址。
 
-自定义中转复用“更多设置 → 连接”的超时、排队、请求体上限和明确拒绝重试设置。现有 `timeout_seconds` 默认 8 秒，保存过的值继续生效。401/403 标记凭据失效，429/529 按服务端等待时间退避，402 进入账户退避，400/404/422 归为配置错误，5xx 归为上游错误。超时、断连和非 JSON 成功响应结束本次判断，不自动重放。
+默认只用所选服务。显式开启 `allow_channel_fallback` 后，其余已填好凭据的 Jev 服务作为备用，只在请求发出前选择；同一次调用遇明确拒绝后的再尝试仍由 `retry_explicit_rejection` 控制。日志只记录安全错误分类与 Key 摘要。
 
-默认不跨服务发送。自定义模式显式开启既有 `allow_channel_fallback` 后，先用中转，再按原 Jev 主渠道与备用渠道顺序取得可用槽位，各渠道使用各自凭据；同一次调用遇明确拒绝后的再尝试仍由 `retry_explicit_rejection` 控制。AstrBot provider 模式由 AstrBot 管理提供商，不进入 Jev 渠道池。日志记录安全错误分类与 Key 摘要，不记录请求 Authorization 或上游错误正文。
-
-旧配置没有这些字段时按表中默认值运行；升级不改人设、阈值、群列表或保存过的节奏设置。
+从旧版本升级：`relay_mode=jev`（或没有该字段）改用原 `primary_channel` 的值；已移除的 `astrbot`（AstrBot 提供商）和 OpenAI 格式 `custom` 中转改为南北绿豆，并在日志中警告，旧 OpenAI 中转地址和 Key 会被清空（升级前配置文件已自动备份为 `.bak`）。`primary_channel` 合并进 `relay_mode` 后删除。
 
 ## 平时只用调这几项
 
