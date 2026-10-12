@@ -79,7 +79,8 @@ async def test_builtin_send_tool_joins_required_outbound(env, kind, answer, tool
         assert (answer if answer != "[PASS]。" else silence.FALLBACK_REPLY) in encoded
     else:
         assert tool_text in encoded
-        assert answer not in encoded
+        if answer not in {"[PASS]。", "[不回复]。"}:
+            assert answer in encoded
     assert event.get_extra(MARK)["sent_parts"] == 1
 
 

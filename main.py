@@ -15,6 +15,7 @@ from contextvars import ContextVar
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.message_components import File, Image, Node, Nodes, Record, Video
 from astrbot.api.star import Context, Star
 from astrbot.core.agent.message import TextPart
 from astrbot.core.star.star_tools import StarTools
@@ -657,6 +658,13 @@ class JevActiveReply(Star):
 
         event.set_extra("_jev_buffered_content", buffered_content)
 
+        def contains_media(value):
+            return any(
+                isinstance(part, (Image, Record, Video, File))
+                for parts in silence._component_lists(value.chain)
+                for part in parts
+            )
+
         async def context_failure_send(chain):
             token = nested.set(asyncio.current_task())
             try:
@@ -686,7 +694,31 @@ class JevActiveReply(Star):
             if event.get_platform_name() == "aiocqhttp" and any(
                 native for native, _ in fragments
             ):
-                plan = await plan_onebot(event, fragments)
+                try:
+                    plan = await plan_onebot(event, fragments)
+                except Exception:
+                    if not any(
+                        contains_media(value)
+                        for native, value in fragments
+                        if not native
+                    ):
+                        raise
+                    # No platform request has started. Keep text and native parts.
+                    safe = [
+                        (
+                            native,
+                            value
+                            if native
+                            else event.chain_result(
+                                [
+                                    copy.deepcopy(p)
+                                    for p in silence._plain_components(value.chain)
+                                ]
+                            ),
+                        )
+                        for native, value in fragments
+                    ]
+                    plan = await plan_onebot(event, safe)
                 if plan is None:
                     plan = await plan_onebot(
                         event, [(False, event.plain_result(silence.FALLBACK_REPLY))]
@@ -726,8 +758,6 @@ class JevActiveReply(Star):
                 ) and not chain.get_plain_text().strip("。.!！?？… \t\r\n"):
                     chain = event.plain_result(silence.FALLBACK_REPLY)
                 if event.get_platform_name() == "aiocqhttp":
-                    from astrbot.api.message_components import File, Node, Nodes, Record
-
                     if len(chain.chain) > 1 and any(
                         isinstance(p, (Record, File)) for p in chain.chain
                     ):
@@ -745,7 +775,29 @@ class JevActiveReply(Star):
                         ]
                     silence.combine_forward_reply(chain, event.get_self_id())
                 if chain.chain:
-                    await transmit(original_send, (chain,), {})
+
+                    async def send_chain():
+                        sequence = event.get_extra("_jev_send_sequence", 0)
+                        try:
+                            return await original_send(chain)
+                        except Exception:
+                            if (
+                                event.get_platform_name() != "aiocqhttp"
+                                or event.get_extra("_jev_send_sequence", 0) != sequence
+                                or not contains_media(chain)
+                            ):
+                                raise
+                            # Local serialization failed before the OneBot call.
+                            safe = event.chain_result(
+                                [
+                                    copy.deepcopy(p)
+                                    for p in silence._plain_components(chain.chain)
+                                ]
+                            )
+                            silence.repair_required_reply(result=safe)
+                            return await original_send(safe)
+
+                    await transmit(send_chain, (), {})
 
         event.set_extra("_jev_flush_output", flush)
 
@@ -1811,9 +1863,7 @@ class JevActiveReply(Star):
                     meta["created"] = time.monotonic()
                 flush = event.get_extra("_jev_flush_output")
                 buffered = event.get_extra("_jev_buffered_content", lambda: False)()
-                if event.get_extra("_jev_tool_delivery") and buffered:
-                    event.set_result(event.chain_result([]))
-                elif not buffered and not self._blocked(event):
+                if not buffered and not self._blocked(event):
                     result = event.get_result()
                     if result is not None and result.chain:
                         await event.send(result)
@@ -2291,13 +2341,6 @@ class JevActiveReply(Star):
             return
         result = event.get_result()
         if self._must_reply(event):
-            if (
-                event.get_extra("_jev_tool_delivery")
-                and event.get_extra("_jev_buffered_content", lambda: False)()
-            ):
-                event.set_result(event.chain_result([]))
-                meta["output_ready"] = False
-                return
             await self._wait_delivery(meta)
             silence.repair_required_reply(
                 result=result,

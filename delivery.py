@@ -179,8 +179,6 @@ def install_send_tool_adapter(mark):
         scoped_context = copy.copy(run_context)
         scoped_context.context = agent_context
         result = await original(tool, scoped_context, **kwargs)
-        if isinstance(result, str) and result.startswith("Message sent to session "):
-            event.set_extra("_jev_tool_delivery", True)
         return result
 
     call._jev_send_tool = True
