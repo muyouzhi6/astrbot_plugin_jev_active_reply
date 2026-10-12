@@ -85,10 +85,14 @@ async def test_forward_is_planned_before_core_segmentation(env, monkeypatch, kin
     monkeypatch.setattr(RespondStage, "initialize", initialize)
     event, bot = adapter_event(kind)
     await pipeline(
-        env, event, adapter=True,
-        parts=[Plain("Introduction"),
-               Node(uin="123", name="Bot", content=[Plain("Answer")]),
-               Plain("Conclusion")],
+        env,
+        event,
+        adapter=True,
+        parts=[
+            Plain("Introduction"),
+            Node(uin="123", name="Bot", content=[Plain("Answer")]),
+            Plain("Conclusion"),
+        ],
     )
     payload = platform_payload(bot)
     assert payload.index("Introduction") < payload.index("Answer")
@@ -100,8 +104,12 @@ async def test_regular_punctuation_components_survive(env):
     wake.configure(env)
     wake.judge_result(env, "reply")
     event, bot = adapter_event("at")
-    await pipeline(env, event, adapter=True,
-                   parts=[Plain("Call f"), Plain("("), Plain("x"), Plain(")")])
+    await pipeline(
+        env,
+        event,
+        adapter=True,
+        parts=[Plain("Call f"), Plain("("), Plain("x"), Plain(")")],
+    )
     payload = bot.transport.await_args.kwargs["message"]
     assert "".join(p["data"]["text"] for p in payload) == "Call f(x)"
 
@@ -109,8 +117,11 @@ async def test_regular_punctuation_components_survive(env):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("dual", [False, True])
 async def test_core_tts_preserves_all_segments(env, monkeypatch, tmp_path, dual):
-    monkeypatch.setattr(SessionServiceManager, "should_process_tts_request",
-                        AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        SessionServiceManager,
+        "should_process_tts_request",
+        AsyncMock(return_value=True),
+    )
     wake.configure(env)
     wake.judge_result(env, "reply")
     path = tmp_path / "synthetic.wav"
@@ -122,10 +133,15 @@ async def test_core_tts_preserves_all_segments(env, monkeypatch, tmp_path, dual)
 
     async def initialize(stage, ctx):
         ctx.astrbot_config["provider_tts_settings"].update(
-            enable=True, dual_output=dual, use_file_service=False,
-            trigger_probability=1.0)
+            enable=True,
+            dual_output=dual,
+            use_file_service=False,
+            trigger_probability=1.0,
+        )
         ctx.plugin_manager.context.get_using_tts_provider = lambda *a: provider
-        ctx.plugin_manager.context.get_using_tts_provider_async = AsyncMock(return_value=provider)
+        ctx.plugin_manager.context.get_using_tts_provider_async = AsyncMock(
+            return_value=provider
+        )
         await original(stage, ctx)
 
     monkeypatch.setattr(ResultDecorateStage, "initialize", initialize)
@@ -139,13 +155,21 @@ async def test_core_tts_preserves_all_segments(env, monkeypatch, tmp_path, dual)
         return original_set(result)
 
     monkeypatch.setattr(event, "set_result", set_result)
-    await pipeline(env, event, adapter=True,
-                   parts=[Plain("First answer"), Plain("Second answer[PASS]。")])
+    await pipeline(
+        env,
+        event,
+        adapter=True,
+        parts=[Plain("First answer"), Plain("Second answer[PASS]。")],
+    )
     assert [c.args[0] for c in provider.get_audio.await_args_list] == [
-        "First answer", "Second answer。"]
+        "First answer",
+        "Second answer。",
+    ]
     calls = bot.transport.await_args_list
     assert len(calls) == (3 if dual else 2)
     assert all(c.kwargs["message"][0]["type"] == "record" for c in calls[:2])
     if dual:
         assert [p["data"]["text"] for p in calls[2].kwargs["message"]] == [
-            "First answer", "Second answer。"]
+            "First answer",
+            "Second answer。",
+        ]

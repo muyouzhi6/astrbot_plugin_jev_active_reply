@@ -340,6 +340,7 @@ async def test_prefix_shim_restores_event_when_generation_is_rejected(env, reaso
     assert ev.get_message_str() == "!" + original
     if reason == "expired":
         env.plugin._expire(ev)
+        await asyncio.sleep(0.05)
     elif reason == "silent":
         env.plugin._finish_silent(ev)
     else:

@@ -30,7 +30,12 @@ from .admission import (
     requires_reply,
 )
 from .client import DecisionError, JevClient
-from .delivery import DeliveryDeclined, EventBotProxy, SplitAdapters
+from .delivery import (
+    DeliveryDeclined,
+    EventBotProxy,
+    SplitAdapters,
+    install_completion_adapter,
+)
 from .policy import (
     Verdict,
     decide,
@@ -81,6 +86,7 @@ class JevActiveReply(Star):
         self.config_lock = asyncio.Lock()
         self.metrics = Metrics()
         self.summary_timer = None
+        install_completion_adapter()
 
     def _cfg(self, key, default):
         return self.config.get(key, default)
@@ -372,14 +378,22 @@ class JevActiveReply(Star):
     async def _permit(self, event):
         meta = event.get_extra(MARK)
         room = self.rooms.rooms.get(event.unified_msg_origin)
-        if not meta or self.closed or self._blocked(event) or meta.get("rejected"):
+        if (
+            not meta
+            or self.closed
+            or self._blocked(event)
+            or meta.get("rejected")
+            or meta.get("finished")
+        ):
             return False
         if room:
             await self._load_quiet(event, room)
         if self._quiet(event, room):
             self._reject(event, None, "quiet_before_delivery")
             return False
-        if not meta.get("reviewed") or not meta.get("output_ready"):
+        if not self._must_reply(event) and (
+            not meta.get("reviewed") or not meta.get("output_ready")
+        ):
             self._reject(event, None, "unapproved_output_suppressed")
             return False
         if time.monotonic() - meta["created"] > self._lifetime():
@@ -395,6 +409,7 @@ class JevActiveReply(Star):
             self.closed
             or self._blocked(event)
             or meta.get("rejected")
+            or meta.get("finished")
             or self._quiet(event, room)
         ):
             return False
@@ -531,6 +546,10 @@ class JevActiveReply(Star):
     def _install_sender(self, event):
         original_send = event.send
         nested = ContextVar("jev_delivery_owner", default=None)
+        if self._must_reply(event):
+            event.set_extra(
+                "_jev_complete_output", lambda: self._complete_output(event)
+            )
 
         async def send_operation(operation, args, kwargs, native=False):
             task = asyncio.current_task()
@@ -551,17 +570,26 @@ class JevActiveReply(Star):
             # our hooks. Clean the actual outgoing chain at the last send point.
             if self._must_reply(event):
                 if not native and hasattr(chain, "chain"):
-                    silence.repair_required_reply(
-                        result=chain, fallback=False
-                    )
+                    self._buffer_marker(event, chain)
+                    silence.repair_required_reply(result=chain, fallback=False)
                     # Core can send Record first, then a marker-only remainder.
-                    if not silence.has_reply_content(chain.chain):
+                    if not silence.has_reply_content(chain.chain) and not any(
+                        getattr(part, "text", "").strip()
+                        and (
+                            meta.get("sent_parts")
+                            or silence.has_reply_content(
+                                getattr(event.get_result(), "chain", [])
+                            )
+                        )
+                        for part in chain.chain
+                    ):
                         return None
                     if event.get_platform_name() == "aiocqhttp":
                         silence.combine_forward_reply(chain, event.get_self_id())
                 if native:
                     for key in ("message", "messages"):
                         if key in kwargs:
+                            kwargs[key] = self._buffer_native(event, kwargs[key])
                             kwargs[key] = silence.repair_native_reply(
                                 kwargs[key],
                                 forward=key == "messages",
@@ -572,9 +600,8 @@ class JevActiveReply(Star):
                     # CQHttp.send(event, message) also accepts positional content.
                     # call_action has only the action name before keyword params.
                     if len(args) > 1:
-                        message = silence.repair_native_reply(
-                            args[1], fallback=False
-                        )
+                        args = (args[0], self._buffer_native(event, args[1]), *args[2:])
+                        message = silence.repair_native_reply(args[1], fallback=False)
                         if message is None:
                             return None
                         args = (
@@ -1095,16 +1122,21 @@ class JevActiveReply(Star):
             deadline = time.monotonic() + min(
                 30, max(1, float(self._cfg("candidate_wait_seconds", 15)))
             )
+            if required:
+                deadline = time.monotonic() + self._lifetime()
             while (
                 (room.busy(time.monotonic()) or bridge.native_busy(event))
                 and (required or generation == room.generation)
                 and not self._blocked(event)
             ):
-                # Required replies stay queued until the current room owner
-                # finishes. Natural candidates retain their bounded wait.
-                remaining = 0.5 if required else deadline - time.monotonic()
+                remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     self._note(event, "candidate_wait_expired")
+                    if required:
+                        await event.send(event.plain_result(silence.FALLBACK_REPLY))
+                        burst.close(event)
+                        event.stop_event()
+                        self._note(event, "candidate_timeout_replied")
                     return
                 signal = room.changed
                 try:
@@ -1319,7 +1351,7 @@ class JevActiveReply(Star):
                 room.last_judged_at = time.monotonic()
             if not verdict.speak or self._cfg("dry_run", False):
                 return
-            if bridge.native_busy(event):
+            if bridge.native_busy(event) and not required:
                 self._note(event, "native_reply_in_progress")
                 return
             if (
@@ -1330,7 +1362,9 @@ class JevActiveReply(Star):
                 self._note(event, "superseded")
                 return
             fresh_cid, conv = await bridge.conversation(self.context, event)
-            if fresh_cid != cid or bridge.fingerprint(conv) != history_hash:
+            if fresh_cid != cid or (
+                not required and bridge.fingerprint(conv) != history_hash
+            ):
                 self._note(event, "conversation_changed")
                 return
             settings = self.context.get_config(umo=umo)
@@ -1463,9 +1497,90 @@ class JevActiveReply(Star):
         )
 
     def _expire(self, event):
+        self._restore_native_prefix(event)
         meta = event.get_extra(MARK)
         if meta and not meta.get("finished"):
-            self._reject(event, None, "request_lease_expired")
+            if self._must_reply(event) and not meta.get("send_depth"):
+                task = asyncio.create_task(self._complete_output(event, expired=True))
+                self.tasks.add(task)
+                task.add_done_callback(self.tasks.discard)
+            else:
+                self._reject(event, None, "request_lease_expired")
+
+    @staticmethod
+    def _buffer_marker(event, chain):
+        meta = event.get_extra(MARK)
+        plains = list(silence._plain_components(chain.chain))
+        if not plains:
+            return
+        plains[0].text = meta.pop("marker_prefix", "") + plains[0].text
+        text = plains[-1].text
+        for size in range(min(len(text), 7), 0, -1):
+            suffix = text[-size:]
+            if any(
+                marker.startswith(suffix) and marker != suffix
+                for marker in ("[PASS]", "[pass]", "[不回复]")
+            ):
+                meta["marker_prefix"] = suffix
+                plains[-1].text = text[:-size]
+                break
+
+    def _buffer_native(self, event, value):
+        root = {"message": copy.deepcopy(value)}
+        fields = list(silence._native_text_fields(root, "message"))
+        if fields:
+            chain = event.chain_result([])
+            for container, key in fields:
+                chain.chain.extend(event.plain_result(container[key]).chain)
+            self._buffer_marker(event, chain)
+            for (container, key), part in zip(fields, chain.chain):
+                container[key] = part.text
+        return root["message"]
+
+    @staticmethod
+    def _resume_required(event):
+        if event.is_stopped() and not any(
+            event.get_extra(key)
+            for key in (
+                silence.RECALL,
+                silence.SILENT,
+                "agent_stop_requested",
+                "_suanle_silent_requested",
+            )
+        ):
+            event.continue_event()
+
+    async def _complete_output(self, event, expired=False):
+        meta = event.get_extra(MARK)
+        if not meta or meta.get("finished") or meta.get("completing"):
+            return
+        meta["completing"] = True
+        try:
+            if self._must_reply(event) and not meta.get("rejected"):
+                # A plugin stopping propagation is not a user recall. Preserve
+                # explicit cancellation flags, but finish an otherwise owed reply.
+                self._resume_required(event)
+                if expired:
+                    meta["created"] = time.monotonic()
+                prefix = meta.pop("marker_prefix", "")
+                if prefix and not self._blocked(event):
+                    # An unfinished control prefix is withheld, never leaked.
+                    self._note(event, "incomplete_control_marker")
+                if not meta.get("sent_parts") and not self._blocked(event):
+                    meta["reviewed"] = meta["output_ready"] = True
+                    await event.send(event.plain_result(silence.FALLBACK_REPLY))
+            self._note(
+                event, "request_timeout_completed" if expired else "output_completed"
+            )
+        except Exception:
+            self._note(event, "output_completion_failed")
+        finally:
+            meta["finished"] = True
+            self._release(event)
+            if expired:
+                meta["rejected"] = True
+                event.set_extra("agent_stop_requested", True)
+                event.stop_event()
 
     @filter.on_llm_request(priority=-100)
     async def on_request(self, event: AstrMessageEvent, req):
@@ -1693,6 +1808,8 @@ class JevActiveReply(Star):
             ):
                 event.set_extra(NORMAL, text)
             return
+        if self._must_reply(event) and not meta.get("rejected"):
+            self._resume_required(event)
         if self._blocked(event):
             self._reject(event, response, "silent_or_cancelled")
             return
@@ -1945,6 +2062,8 @@ class JevActiveReply(Star):
             return
         meta = event.get_extra(MARK)
         if meta:
+            if self._must_reply(event):
+                await self._complete_output(event)
             # Late decorators may consume the result using only silent sends.
             # Decide fallback after the complete output, never per fragment.
             if (

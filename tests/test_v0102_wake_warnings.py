@@ -335,7 +335,10 @@ async def test_forward_nodes_clean_recursively_without_extra_send(
     assert payload.count(silence.FALLBACK_REPLY) == (0 if body else 1)
     send.assert_awaited_once()
     assert len(send.await_args.args[0].chain) == 1
-    assert send.await_args.args[0].chain[0] is node
+    if body or stage != "final_send":
+        assert send.await_args.args[0].chain[0] is node
+    else:
+        assert send.await_args.args[0].get_plain_text() == silence.FALLBACK_REPLY
 
 
 @pytest.mark.asyncio
@@ -453,7 +456,7 @@ async def test_native_decorator_send_repairs_actual_payload(env, route, form):
 
     async def native(ev):
         result = await send_native(ev, route, message)
-        assert result == {"message_id": 42}
+        assert result == ({"message_id": 42} if form == "media" else None)
 
     await pipeline(env, event, adapter=True, native_send=native)
     payload = platform_payload(bot)

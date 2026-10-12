@@ -40,6 +40,9 @@ def _clean_texts(values):
     # setter would collapse all Plain components ahead of intervening media.
     text = "".join(values)
     spans = [match.span() for match in MARKER.finditer(text)]
+    if spans and not _meaningful(MARKER.sub("", text)):
+        yield from ("" for _ in values)
+        return
     offset = 0
     for value in values:
         end = offset + len(value)
@@ -127,6 +130,15 @@ def repair_required_reply(response=None, result=None, *, fallback=True):
     parts = result.chain
     lists = list(_component_lists(parts))
     plains = list(_plain_components(parts))
+    for items in lists:
+        run = []
+        for part in [*items, None]:
+            if isinstance(part, Plain):
+                run.append(part)
+            else:
+                for plain, text in zip(run, _clean_texts([p.text for p in run])):
+                    plain.text = text
+                run = []
     for part, text in zip(plains, _clean_texts([part.text for part in plains])):
         part.text = text
     if fallback and not has_reply_content(parts):
@@ -246,7 +258,9 @@ def repair_native_reply(message, *, forward=False, fallback=True):
         fields, _clean_texts([container[key] for container, key in fields])
     ):
         container[key] = text
-    if not _native_has_content(root["message"]):
+    if not _native_has_content(root["message"]) and not (
+        not fallback and any(container[key].strip() for container, key in fields)
+    ):
         if not fallback:
             return None
         if fields:

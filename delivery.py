@@ -1,7 +1,30 @@
-"""Event-scoped delivery control; no global platform or Core monkeypatch."""
+"""Event-scoped delivery control with a transparent Core completion adapter."""
 
 import copy
+from functools import wraps
 from types import SimpleNamespace
+
+
+def install_completion_adapter():
+    """Core has no completion hook for empty/stopped results; scope by event."""
+    from astrbot.core.pipeline.process_stage.stage import ProcessStage
+
+    original = ProcessStage.process
+    if getattr(original, "_jev_completion", False):
+        return
+
+    @wraps(original)
+    async def process(stage, event):
+        try:
+            async for item in original(stage, event):
+                yield item
+        finally:
+            finish = event.get_extra("_jev_complete_output")
+            if finish is not None:
+                await finish()
+
+    process._jev_completion = True
+    ProcessStage.process = process
 
 
 class DeliveryDeclined(Exception):
