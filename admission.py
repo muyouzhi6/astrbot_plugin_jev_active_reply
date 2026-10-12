@@ -113,6 +113,28 @@ def explicit_wake(event, config):
     return any(name in plain for name in names)
 
 
+def requires_reply(event, config):
+    """Recognize user requests without mistaking Jev's native re-arm for a wake."""
+    if event.is_private_chat():
+        return bool(
+            str(
+                event.get_extra("_gemini_stt_transcript")
+                or event.get_message_str()
+                or ""
+            ).strip()
+            or any(
+                type(part).__name__ in ("Image", "Record", "Video", "File")
+                for part in event.get_messages()
+            )
+        )
+    if event.get_extra("_jev_direct_wake") or (
+        event.is_at_or_wake_command and not event.get_extra("_active_trigger")
+    ):
+        return True
+    # Use the same name, sender and quote rules as ingress, not substring matching.
+    return input_decision(event, config)[0] == "direct"
+
+
 def local_prefilter(event, config, recent_text="", recent_at=0.0, now=0.0):
     """Filter content-free interjections and repeated declined topics, not photos."""
     if not config.get("local_prefilter_enabled", True) or explicit_wake(event, config):

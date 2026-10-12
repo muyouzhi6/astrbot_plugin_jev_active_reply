@@ -27,6 +27,7 @@ from .admission import (
     input_decision,
     local_prefilter,
     related_topic,
+    requires_reply,
 )
 from .client import DecisionError, JevClient
 from .delivery import DeliveryDeclined, EventBotProxy, SplitAdapters
@@ -159,12 +160,20 @@ class JevActiveReply(Star):
             )
         )
 
+    def _must_reply(self, event):
+        if silence.must_reply(event, self._silence_settings()):
+            return True
+        if requires_reply(event, self.config):
+            event.set_extra(silence.MUST_REPLY, True)
+            return True
+        return False
+
     def _can_keep_silent(self, event):
         cfg = self._silence_settings()
         return (
             self._silence_scope(event)
             and cfg.get("tool_enable", True)
-            and not silence.must_reply(event, cfg)
+            and not self._must_reply(event)
             and (
                 bool(event.get_extra(MARK))
                 or cfg.get(
@@ -398,6 +407,7 @@ class JevActiveReply(Star):
             or room.pending != meta["ticket"]
             or (
                 not meta.get("committed")
+                and not self._must_reply(event)
                 and self._related_generation(
                     room,
                     {
@@ -883,6 +893,7 @@ class JevActiveReply(Star):
         )
         if event.get_extra(MARK):
             return  # The same event already owns a single generation lease.
+        self._must_reply(event)
         if owned:
             event.set_extra("_jev_takeover", True)
             # Suppress the unapproved native wake; only an admitted Jev turn
@@ -1076,14 +1087,15 @@ class JevActiveReply(Star):
 
     async def _evaluate(self, event, room, target, generation):
         now = time.monotonic()
-        if now < room.delivery_backoff_until:
+        required = self._must_reply(event)
+        if not required and now < room.delivery_backoff_until:
             self._note(event, "delivery_backoff")
             return
         if room.busy(now):
             return
         pacing = (
             0
-            if event.get_extra("_jev_merged_message_ids")
+            if required or event.get_extra("_jev_merged_message_ids")
             else max(
                 0,
                 min(30, max(1, float(self._cfg("evaluation_interval", 10))))
@@ -1109,7 +1121,7 @@ class JevActiveReply(Star):
             else float(self._cfg("min_reply_interval", 8))
         )
         delay = max(0, min(30, interval) - (now - room.last_sent))
-        if delay:
+        if delay and not required:
             await asyncio.sleep(delay)
             if generation != room.generation or self._blocked(event):
                 return
@@ -1119,9 +1131,13 @@ class JevActiveReply(Star):
         )
         eval_limit = max(0, int(self._cfg("daily_evaluation_limit", 0)))
         reply_limit = max(0, int(self._cfg("daily_reply_limit", 0)))
-        if (
-            eval_limit and await self.ledger.acount(umo, evaluation_kind) >= eval_limit
-        ) or (reply_limit and await self.ledger.acount(umo, "sent") >= reply_limit):
+        if not required and (
+            (
+                eval_limit
+                and await self.ledger.acount(umo, evaluation_kind) >= eval_limit
+            )
+            or (reply_limit and await self.ledger.acount(umo, "sent") >= reply_limit)
+        ):
             self._note(event, "daily_budget")
             return
         ticket = uuid.uuid4().hex
@@ -1135,9 +1151,24 @@ class JevActiveReply(Star):
         room.evaluated_at = now
         dispatched = False
         try:
-            state, cid, history_hash = await asyncio.wait_for(
-                bridge.build_snapshot(self.context, event, room, target, self.config), 3
-            )
+            snapshot_ready = True
+            try:
+                state, cid, history_hash = await asyncio.wait_for(
+                    bridge.build_snapshot(
+                        self.context, event, room, target, self.config
+                    ),
+                    3,
+                )
+            except Exception:
+                if not required:
+                    raise
+                # The native collector still loads the real persona and history.
+                # An unavailable Jev snapshot must not revoke the user's request.
+                cid, conv = await bridge.conversation(self.context, event)
+                history_hash = bridge.fingerprint(conv)
+                state = {"target_message": target, "activity": {}, "truncated": False}
+                snapshot_ready = False
+                self._note(event, "explicit_snapshot_unavailable")
             if event.get_extra("_jev_takeover"):
                 state["activity"]["interaction"] = (
                     "private_chat" if event.is_private_chat() else "explicit_wake"
@@ -1172,12 +1203,16 @@ class JevActiveReply(Star):
             )
             recent = sum(now - t < 120 for t in room.sent_times)
             decision_started = time.monotonic()
-            if (
+            if not snapshot_ready:
+                response = {}
+                verdict = Verdict(True, "respond", "explicit_reply_required")
+            elif (
                 "Image" in target["actual_media"]
                 and self._cfg("image_decision_mode", "text_gate") == "native_vision"
             ):
                 if (
-                    self._cfg("second_review", "always") != "adaptive"
+                    not required
+                    and self._cfg("second_review", "always") != "adaptive"
                     and not await self.client.review_ready()
                 ):
                     self._note(event, "visual_review_channel_unavailable")
@@ -1189,21 +1224,31 @@ class JevActiveReply(Star):
                     response = await self._judge(
                         event, state, questions_for(self.config)
                     )
-                except DecisionError as exc:
-                    self._note(event, exc.code, {"status": exc.status})
-                    return
-                if self._cfg("decision_mode", "classic") == "natural":
-                    verdict = natural_decide(
-                        response["values"], self._cfg("style", "balanced"), self.config
-                    )
-                else:
-                    verdict = decide(
-                        response["values"],
-                        active,
-                        recent,
-                        self._cfg("style", "balanced"),
-                        self.config,
-                    )
+                    if self._cfg("decision_mode", "classic") == "natural":
+                        verdict = natural_decide(
+                            response["values"],
+                            self._cfg("style", "balanced"),
+                            self.config,
+                        )
+                    else:
+                        verdict = decide(
+                            response["values"],
+                            active,
+                            recent,
+                            self._cfg("style", "balanced"),
+                            self.config,
+                        )
+                except Exception as exc:
+                    if isinstance(exc, DecisionError):
+                        self._note(event, exc.code, {"status": exc.status})
+                    elif required:
+                        self._note(event, "explicit_judgment_unavailable")
+                    else:
+                        raise
+                    if not required:
+                        return
+                    response = {"values": {}}
+                    verdict = Verdict(True, "respond", "explicit_reply_required")
                 values = response["values"]
                 if (
                     not verdict.speak
@@ -1213,6 +1258,8 @@ class JevActiveReply(Star):
                     and values["intrusive"] <= 0.25
                 ):
                     verdict = Verdict(True, "adjudicate", "native_context_adjudication")
+            if required:
+                verdict = Verdict(True, "respond", "explicit_reply_required")
             details = {
                 **response,
                 "mode": verdict.mode,
@@ -1237,7 +1284,7 @@ class JevActiveReply(Star):
             if (
                 generation != room.generation
                 or self._blocked(event)
-                or time.monotonic() - now > 20
+                or (not required and time.monotonic() - now > 20)
             ):
                 self._note(event, "superseded")
                 return
@@ -1397,9 +1444,7 @@ class JevActiveReply(Star):
         if not meta["cid"]:
             meta["cid"] = str(getattr(req.conversation, "cid", ""))
         # Adapt only this request's scene; never change ContextAware's global state.
-        if meta["mode"] in ("continue", "respond") and not event.get_extra(
-            "_jev_takeover"
-        ):
+        if meta["mode"] in ("continue", "respond") and not self._must_reply(event):
             for part in req.extra_user_content_parts:
                 scene = getattr(part, "text", "")
                 if scene.strip().startswith("<conversation_scene>"):
@@ -1424,20 +1469,17 @@ class JevActiveReply(Star):
                 "未实际看图时不能猜图中细节。不要提及门控、评分或这段提示。"
                 "决定不说话时优先调用 keep_silent；工具不可用时只返回 [PASS]，不要向群里解释为什么沉默。"
             )
-            if event.get_extra("_jev_takeover"):
+            if self._must_reply(event):
                 notice = (
-                    "这是经 Jev 判断的用户呼叫或私聊。按原文和合并后的补充内容回应，"
-                    "保持当前人设、记忆和生活状态；没有新内容时可以调用 keep_silent。"
+                    "这是需要回复的用户呼叫或私聊。按原文和合并后的补充内容回应，"
+                    "保持当前人设、记忆和生活状态；请给出正常回复，简短呼叫也应自然应答。"
                     "未实际看图时不要猜图中细节，不要提及门控或评分。"
-                    "决定不说话时优先调用 keep_silent；工具不可用时只返回 [PASS]。"
                 )
             guidance = str(self._cfg("behavior_guidance", "")).strip()
             if guidance:
                 notice += "\n本插件自主轮行为补充（不改身份设定）：" + guidance
             req.extra_user_content_parts.append(TextPart(text=notice).mark_as_temp())
-            if meta["mode"] in ("continue", "respond") and not event.get_extra(
-                "_jev_takeover"
-            ):
+            if meta["mode"] in ("continue", "respond") and not self._must_reply(event):
                 req.extra_user_content_parts.append(
                     TextPart(
                         text=(
@@ -1469,7 +1511,10 @@ class JevActiveReply(Star):
             ]["effective_system_prompt"].replace(
                 persona, "[Same persona as bot_persona; preserved there verbatim]", 1
             )
-        if self._cfg("second_review", "always") not in ("off", "adaptive"):
+        if not self._must_reply(event) and self._cfg("second_review", "always") not in (
+            "off",
+            "adaptive",
+        ):
             try:
                 fit_state(
                     {
@@ -1611,7 +1656,8 @@ class JevActiveReply(Star):
             self._reject(event, response, "silent_or_cancelled")
             return
         room = self.rooms.rooms.get(event.unified_msg_origin)
-        if room and room.last_text and text == room.last_text.strip():
+        required = self._must_reply(event)
+        if not required and room and room.last_text and text == room.last_text.strip():
             self._reject(event, response, "duplicate_reply")
             return
         try:
@@ -1624,6 +1670,14 @@ class JevActiveReply(Star):
             return
         meta["draft"] = text
         meta["response"] = response
+        if required:
+            # Jev reviews may not veto a reply owed to the sender. Cancellation,
+            # recall, conversation ownership and delivery checks still apply.
+            meta["reviewed"] = True
+            meta["approved_generation"] = (
+                room.generation if room else meta["generation"]
+            )
+            return
         review = self._cfg("second_review", "always")
         changed = room is None or self._related_generation(room, meta)
         if review == "adaptive":

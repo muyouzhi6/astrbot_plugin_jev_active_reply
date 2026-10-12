@@ -6,6 +6,7 @@ import time
 
 SILENT = "_jev_silent_requested"
 RECALL = "_recall_stop_requested"
+MUST_REPLY = "_jev_must_reply"
 
 
 def values(config, key):
@@ -14,7 +15,8 @@ def values(config, key):
 
 def must_reply(event, config):
     return (
-        str(event.get_sender_id()) in values(config, "must_reply_uid")
+        bool(event.get_extra(MUST_REPLY) or event.get_extra("_jev_takeover"))
+        or str(event.get_sender_id()) in values(config, "must_reply_uid")
         or str(event.get_group_id()) in values(config, "must_reply_gid")
         or event.unified_msg_origin in values(config, "must_reply_umo")
     )
