@@ -743,10 +743,7 @@ class JevActiveReply(Star):
                         getattr(part, "text", "").strip()
                         and (
                             (final and silence.incomplete_marker(part.text))
-                            or meta.get("sent_parts")
-                            or silence.has_reply_content(
-                                getattr(event.get_result(), "chain", [])
-                            )
+                            or part.text.strip("。.!！?？… \t\r\n")
                         )
                         for part in chain.chain
                     ):
@@ -1127,6 +1124,13 @@ class JevActiveReply(Star):
         )
         if event.get_extra(MARK):
             return  # The same event already owns a single generation lease.
+        if (
+            owned
+            and self._cfg("strict_conflicts", True)
+            and bridge.conflicts(self.context, event)
+        ):
+            self._note(event, "competing_waker")
+            return  # No request ownership was accepted; retain the native wake.
         self._must_reply(event)
         if owned:
             event.set_extra("_jev_takeover", True)
@@ -1247,9 +1251,17 @@ class JevActiveReply(Star):
         ):
             self._note(event, "directed_elsewhere")
             return
-        if not target["content"].strip() and not target["actual_media"]:
+        if (
+            not target["content"].strip()
+            and not target["actual_media"]
+            and not self._must_reply(event)
+        ):
             return
-        if self._cfg("strict_conflicts", True) and not self._cfg("dry_run", False):
+        if (
+            not event.get_extra("_jev_takeover")
+            and self._cfg("strict_conflicts", True)
+            and not self._cfg("dry_run", False)
+        ):
             found = bridge.conflicts(self.context, event)
             if found:
                 self._note(event, "competing_waker")
@@ -1972,7 +1984,17 @@ class JevActiveReply(Star):
                 event.set_extra(NORMAL, text)
             return
         if self._must_reply(event) and not meta.get("rejected"):
+            stopped = event.is_stopped()
             self._resume_required(event)
+            if stopped and not self._blocked(event):
+                # Buffered external text owns a stop just like delivered media.
+                flush = event.get_extra("_jev_flush_output")
+                if flush:
+                    await flush()
+                if meta.get("sent_parts"):
+                    await self._complete_output(event)
+                    silence.clear_output(event, response)
+                    return
         if self._blocked(event):
             self._reject(event, response, "silent_or_cancelled")
             return
@@ -1985,6 +2007,7 @@ class JevActiveReply(Star):
             silence.repair_required_reply(
                 response=response, fallback=not meta.get("sent_parts")
             )
+            event.set_extra("_llm_reasoning_content", response.reasoning_content)
             text = str(response.completion_text or "").strip()
         if (is_refusal(text) or not text) and not (
             required

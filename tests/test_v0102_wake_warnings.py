@@ -183,9 +183,10 @@ async def pipeline(
                 Image.fromURL("https://example.invalid/a.png")
             )
         responses.append(response)
+        # Core caches reasoning before invoking OnLLMResponseEvent.
+        ev.set_extra("_llm_reasoning_content", response.reasoning_content)
         await env.plugin.on_response(ev, response)
         if not ev.is_stopped():
-            ev.set_extra("_llm_reasoning_content", response.reasoning_content)
             ev.set_result(
                 ev.chain_result(response.result_chain.chain)
                 if response.result_chain is not None
