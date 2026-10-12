@@ -2,11 +2,48 @@
 
 from collections import OrderedDict, deque
 import json
+import re
 import time
+
+from astrbot.api.message_components import Plain
 
 SILENT = "_jev_silent_requested"
 RECALL = "_recall_stop_requested"
 MUST_REPLY = "_jev_must_reply"
+MARKER = re.compile(r"\[(?:PASS|pass|不回复)\]")
+FALLBACK_REPLY = "我在，请再说一下你的问题。"
+
+
+def repair_required_reply(response=None, result=None):
+    """Remove silence markers without starting a second generation or send."""
+    if response is not None:
+        result = response.result_chain
+    text = str(response.completion_text or "") if response is not None else ""
+    parts = result.chain if result is not None else []
+    if not MARKER.search(text) and not any(
+        isinstance(part, Plain) and MARKER.search(part.text) for part in parts
+    ):
+        return
+
+    def clean(value):
+        cleaned = MARKER.sub("", value).strip()
+        if MARKER.search(value) and not cleaned.strip("。.!！?？,，;；:： \t\r\n"):
+            return ""
+        return cleaned
+
+    for part in parts:
+        if isinstance(part, Plain):
+            part.text = clean(part.text)
+    parts[:] = [part for part in parts if not isinstance(part, Plain) or part.text]
+    reply = (
+        clean(text)
+        or "".join(part.text for part in parts if isinstance(part, Plain)).strip()
+        or FALLBACK_REPLY
+    )
+    if response is not None:
+        response.completion_text = reply
+    if result is not None and not any(isinstance(part, Plain) for part in parts):
+        parts.insert(0, Plain(reply))
 
 
 def values(config, key):

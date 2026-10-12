@@ -1045,7 +1045,8 @@ class JevActiveReply(Star):
                     self._note(event, reason)
                     return
             self._coalesce(event, room, cid)
-        if generation != room.generation or self._blocked(event):
+        required = self._must_reply(event)
+        if (not required and generation != room.generation) or self._blocked(event):
             return
         target = self._outline(event)
         task = asyncio.current_task()
@@ -1058,7 +1059,7 @@ class JevActiveReply(Star):
             )
             while (
                 (room.busy(time.monotonic()) or bridge.native_busy(event))
-                and generation == room.generation
+                and (required or generation == room.generation)
                 and not self._blocked(event)
             ):
                 remaining = deadline - time.monotonic()
@@ -1072,7 +1073,7 @@ class JevActiveReply(Star):
                     if time.monotonic() >= deadline:
                         self._note(event, "candidate_wait_expired")
                         return
-            if generation != room.generation or self._blocked(event):
+            if (not required and generation != room.generation) or self._blocked(event):
                 return
             await self._evaluate(event, room, target, generation)
         except asyncio.CancelledError:
@@ -1109,7 +1110,7 @@ class JevActiveReply(Star):
             except asyncio.TimeoutError:
                 pass
             if (
-                generation != room.generation
+                (not required and generation != room.generation)
                 or self._blocked(event)
                 or room.busy(time.monotonic())
             ):
@@ -1142,7 +1143,7 @@ class JevActiveReply(Star):
             return
         ticket = uuid.uuid4().hex
         if (
-            generation != room.generation
+            (not required and generation != room.generation)
             or self._blocked(event)
             or room.busy(time.monotonic())
         ):
@@ -1193,7 +1194,7 @@ class JevActiveReply(Star):
                 room.cid = cid
                 state["activity"]["last_delivered_reply"] = ""
                 state["activity"]["last_reply_to"] = ""
-            if generation != room.generation or self._blocked(event):
+            if (not required and generation != room.generation) or self._blocked(event):
                 return
             await self.ledger.abump(umo, evaluation_kind)
             active = bool(
@@ -1282,7 +1283,7 @@ class JevActiveReply(Star):
                 self._note(event, "native_reply_in_progress")
                 return
             if (
-                generation != room.generation
+                (not required and generation != room.generation)
                 or self._blocked(event)
                 or (not required and time.monotonic() - now > 20)
             ):
@@ -1652,11 +1653,17 @@ class JevActiveReply(Star):
             ):
                 event.set_extra(NORMAL, text)
             return
-        if self._blocked(event) or is_refusal(text) or not text:
+        if self._blocked(event):
+            self._reject(event, response, "silent_or_cancelled")
+            return
+        required = self._must_reply(event)
+        if required:
+            silence.repair_required_reply(response=response)
+            text = str(response.completion_text or "").strip()
+        if is_refusal(text) or not text:
             self._reject(event, response, "silent_or_cancelled")
             return
         room = self.rooms.rooms.get(event.unified_msg_origin)
-        required = self._must_reply(event)
         if not required and room and room.last_text and text == room.last_text.strip():
             self._reject(event, response, "duplicate_reply")
             return
@@ -1832,6 +1839,8 @@ class JevActiveReply(Star):
             self._reject(event, None, "output_cancelled")
             return
         result = event.get_result()
+        if self._must_reply(event):
+            silence.repair_required_reply(result=result)
         text = result.get_plain_text().strip() if result else ""
         if is_refusal(text):
             self._reject(event, None, "refusal_marker")
