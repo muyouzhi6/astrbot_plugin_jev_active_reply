@@ -503,7 +503,7 @@ class JevClient:
             json=payload,
             headers={
                 "Authorization": f"Bearer {key}",
-                "User-Agent": "JevActiveReply/0.10.1",
+                "User-Agent": "JevActiveReply/0.10.3",
             },
             allow_redirects=False,
         ) as response:

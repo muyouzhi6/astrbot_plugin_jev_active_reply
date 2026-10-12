@@ -49,7 +49,8 @@ def _clean_texts(values):
                 kept.append(value[cursor : max(0, start - offset)])
                 cursor = min(len(value), stop - offset)
         kept.append(value[cursor:])
-        yield "".join(kept)
+        cleaned = "".join(kept)
+        yield cleaned if _meaningful(cleaned) else ""
         offset = end
 
 
@@ -110,6 +111,10 @@ def _insert_fallback(parts):
 def repair_required_reply(response=None, result=None, *, fallback=True):
     """Clean the entire reply; add a fallback only if it has no useful content."""
     if response is not None:
+        if response.reasoning_content:
+            response.reasoning_content = next(
+                _clean_texts([response.reasoning_content])
+            )
         if response.result_chain is None:
             response.result_chain = MessageChain(
                 [Plain(response.completion_text or "")]
@@ -139,6 +144,31 @@ def repair_required_reply(response=None, result=None, *, fallback=True):
                 or (isinstance(part, Nodes) and not part.nodes)
             )
         ]
+
+
+def combine_forward_reply(result, sender_id):
+    """Keep mixed forward content in one OneBot API call, in original order."""
+    if len(result.chain) < 2 or not any(
+        isinstance(part, (Node, Nodes)) for part in result.chain
+    ):
+        return
+    nodes, pending = [], []
+
+    def flush():
+        if pending:
+            nodes.append(
+                Node(uin=str(sender_id), name="AstrBot", content=list(pending))
+            )
+            pending.clear()
+
+    for part in result.chain:
+        if isinstance(part, (Node, Nodes)):
+            flush()
+            nodes.extend(part.nodes if isinstance(part, Nodes) else [part])
+        else:
+            pending.append(part)
+    flush()
+    result.chain[:] = [Nodes(nodes)]
 
 
 def _native_text_fields(container, key):
@@ -206,7 +236,7 @@ def _native_fallback(value, forward=False):
     return FALLBACK_REPLY
 
 
-def repair_native_reply(message, *, forward=False):
+def repair_native_reply(message, *, forward=False, fallback=True):
     """Copy OneBot payloads so other plugin invocations keep their originals."""
     root = {"message": deepcopy(message)}
     fields = list(_native_text_fields(root, "message"))
@@ -215,6 +245,8 @@ def repair_native_reply(message, *, forward=False):
     ):
         container[key] = text
     if not _native_has_content(root["message"]):
+        if not fallback:
+            return None
         if fields:
             for index, (container, key) in enumerate(fields):
                 container[key] = "" if index else FALLBACK_REPLY

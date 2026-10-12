@@ -122,6 +122,7 @@ async def pipeline(
     adapter=False,
     display_reasoning=False,
     native_send=None,
+    t2i=False,
 ):
     """Use Core's native tail, decoration ordering and final respond stage."""
     send = AsyncMock(wraps=event.send) if adapter else AsyncMock()
@@ -141,7 +142,7 @@ async def pipeline(
     config["provider_tts_settings"]["enable"] = False
     config["content_safety"]["also_use_in_response"] = False
     config["provider_settings"]["display_reasoning_text"] = display_reasoning
-    config["t2i"] = False
+    config["t2i"] = t2i
     context = NS(
         astrbot_config=config,
         plugin_manager=NS(

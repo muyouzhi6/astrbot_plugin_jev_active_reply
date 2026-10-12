@@ -557,18 +557,29 @@ class JevActiveReply(Star):
                     # Core can send Record first, then a marker-only remainder.
                     if not silence.has_reply_content(chain.chain):
                         return None
+                    if event.get_platform_name() == "aiocqhttp":
+                        silence.combine_forward_reply(chain, event.get_self_id())
                 if native:
                     for key in ("message", "messages"):
                         if key in kwargs:
                             kwargs[key] = silence.repair_native_reply(
-                                kwargs[key], forward=key == "messages"
+                                kwargs[key],
+                                forward=key == "messages",
+                                fallback=not meta.get("sent_parts"),
                             )
+                            if kwargs[key] is None:
+                                return None
                     # CQHttp.send(event, message) also accepts positional content.
                     # call_action has only the action name before keyword params.
                     if len(args) > 1:
+                        message = silence.repair_native_reply(
+                            args[1], fallback=not meta.get("sent_parts")
+                        )
+                        if message is None:
+                            return None
                         args = (
                             args[0],
-                            silence.repair_native_reply(args[1]),
+                            message,
                             *args[2:],
                         )
             token = nested.set(task)
@@ -1873,7 +1884,9 @@ class JevActiveReply(Star):
             return
         result = event.get_result()
         if self._must_reply(event):
-            silence.repair_required_reply(result=result)
+            silence.repair_required_reply(
+                result=result, fallback=not meta.get("sent_parts")
+            )
         text = result.get_plain_text().strip() if result else ""
         if is_refusal(text):
             self._reject(event, None, "refusal_marker")
@@ -2116,7 +2129,7 @@ class JevActiveReply(Star):
             await asyncio.shield(self.audit_task)
         pools = [pool.status() for pool in self.client.pools.values()]
         lines = [
-            "Jev 主动回复插件 0.10.1 · 木有知",
+            "Jev 主动回复插件 0.10.3 · 木有知",
             f"当前会话：{'已启用' if self._enabled(event) else '未启用'}",
         ]
         names = {
