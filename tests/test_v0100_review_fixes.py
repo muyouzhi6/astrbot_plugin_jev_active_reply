@@ -1,13 +1,17 @@
 """Release-review regressions using synthetic messages and native Core APIs."""
 
+import asyncio
 import time
-from copy import deepcopy
+from copy import copy, deepcopy
 from itertools import product
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock
 
 import pytest
+from astrbot.api.message_components import Image
 from astrbot.core.astr_agent_run_util import run_agent
+from astrbot.core import astr_main_agent
+from astrbot.core.astr_main_agent import MainAgentBuildConfig
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.provider.entities import LLMResponse
 
@@ -15,6 +19,7 @@ from ..main import MARK
 from ..state import RoomBook, scope_id
 from .test_v0100_takeover import incoming, pipeline
 from . import test_v020 as previous
+from .test_integration import collect_request
 
 env = previous.env
 
@@ -184,3 +189,255 @@ async def test_private_quiet_cancels_pending_generation(env):
     assert [result async for result in env.plugin.quiet_room(quiet, 10)]
     assert ev.is_stopped() and ev.get_extra(MARK)["rejected"]
     assert not env.plugin.pending_events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["at", "prefix", "name", "private"])
+@pytest.mark.parametrize(
+    ("configured_prefix", "native_prefix", "bot_prefix"),
+    [("!", "!", []), ("/!", "!", ["/"])],
+)
+async def test_takeover_bypasses_provider_wake_prefix_after_jev_admission(
+    env, kind, configured_prefix, native_prefix, bot_prefix
+):
+    """An admitted takeover must reach Core even when provider wake_prefix is set."""
+    env.cfg.update(
+        takeover_wake_messages=True,
+        enable_private_chat=True,
+        wake_names=["测试助手"],
+    )
+    env.settings["wake_prefix"] = bot_prefix
+    env.settings["provider_settings"]["wake_prefix"] = configured_prefix
+    original_settings = deepcopy(env.settings)
+    ev = incoming(kind)
+    original = ev.get_message_str()
+    transport = AsyncMock()
+    ev.send = transport
+    await env.plugin.on_input(ev)
+    await env.plugin.on_message(ev)
+    assert ev.get_extra("provider_request") is None
+    request, _ = await collect_request(
+        ev,
+        env.ctx,
+        MainAgentBuildConfig(
+            tool_call_timeout=30,
+            provider_wake_prefix=native_prefix,
+            provider_settings=env.settings["provider_settings"],
+        ),
+    )
+    assert request is not None
+    assert request.prompt == original
+    assert request.conversation.cid == env.cid
+    assert ev.get_extra("provider_request") is request
+    await env.plugin.restore_takeover_message(ev, request)
+    await env.plugin.on_request(ev, request)
+    assert ev.get_message_str() == original
+    response = LLMResponse(role="assistant", completion_text="合成的回答")
+    await env.plugin.on_response(ev, response)
+    ev.set_result(ev.plain_result(response.completion_text))
+    await env.plugin.before_output(ev)
+    await ev.send(ev.get_result())
+    transport.assert_awaited_once()
+    assert env.plugin.metrics.replies == 1
+    assert env.settings == original_settings
+    assert ev.get_extra(MARK) and ev.get_extra("_jev_takeover")
+    assert "unsupported_runtime_settings" not in [
+        reason for _, reason, _ in env.plugin.audit_queue
+    ]
+    assert env.plugin.client.evaluate.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["at", "private"])
+async def test_provider_prefix_respects_disabled_takeover_and_declined_turn(env, kind):
+    env.settings["provider_settings"]["wake_prefix"] = "!"
+    ev = incoming(kind)
+    original = ev.get_message_str()
+    await env.plugin.on_input(ev)
+    await env.plugin.on_message(ev)
+    config = MainAgentBuildConfig(
+        tool_call_timeout=30,
+        provider_wake_prefix="!",
+        provider_settings=env.settings["provider_settings"],
+    )
+    if hasattr(astr_main_agent, "collect_initial_request"):
+        request, _ = await collect_request(ev, env.ctx, config)
+        assert request is None
+    else:
+        assert (
+            await astr_main_agent.build_main_agent(
+                event=ev, plugin_context=env.ctx, config=config, provider=object()
+            )
+            is None
+        )
+    assert ev.get_message_str() == original
+    env.plugin.client.evaluate.assert_not_awaited()
+
+    env.cfg.update(takeover_wake_messages=True, enable_private_chat=True)
+    env.plugin.client.evaluate.return_value = {
+        **env.response,
+        "values": dict(addressed=0, continuation=0, worthwhile=0, intrusive=1),
+    }
+    rejected = incoming(kind, mid="declined")
+    await env.plugin.on_input(rejected)
+    await env.plugin.on_message(rejected)
+    assert rejected.is_stopped()
+    assert rejected.get_message_str() == original
+    assert not rejected.get_extra(MARK)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["at", "private"])
+async def test_existing_provider_prefix_is_not_doubled(env, kind):
+    env.cfg.update(takeover_wake_messages=True, enable_private_chat=True)
+    env.settings["provider_settings"]["wake_prefix"] = "!"
+    ev = incoming(kind, text="!模型上下文怎么处理")
+    await env.plugin.on_input(ev)
+    await env.plugin.on_message(ev)
+    request, _ = await collect_request(
+        ev,
+        env.ctx,
+        MainAgentBuildConfig(
+            tool_call_timeout=30,
+            provider_wake_prefix="!",
+            provider_settings=env.settings["provider_settings"],
+        ),
+    )
+    assert request.prompt == "模型上下文怎么处理"
+    assert ev.get_message_str() == "!模型上下文怎么处理"
+    assert "native_prefix_original" not in ev.get_extra(MARK)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["rejected", "expired", "silent"])
+async def test_prefix_shim_restores_event_when_generation_is_rejected(env, reason):
+    env.cfg["takeover_wake_messages"] = True
+    env.settings["provider_settings"]["wake_prefix"] = "!"
+    ev = incoming("at")
+    original = ev.get_message_str()
+    await env.plugin.on_input(ev)
+    await env.plugin.on_message(ev)
+    assert ev.get_message_str() == "!" + original
+    if reason == "expired":
+        env.plugin._expire(ev)
+    elif reason == "silent":
+        env.plugin._finish_silent(ev)
+    else:
+        env.plugin._reject(ev, None, "cancelled_before_generation")
+    assert ev.get_message_str() == original
+    assert ev.is_stopped()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["at", "private"])
+@pytest.mark.parametrize("phase", ["judge", "generate"])
+async def test_provider_prefix_burst_keeps_one_native_reply(env, kind, phase):
+    env.cfg.update(
+        takeover_wake_messages=True,
+        enable_private_chat=True,
+        burst_merge_enabled=True,
+        evaluation_interval=1,
+    )
+    env.settings["provider_settings"]["wake_prefix"] = "!"
+    entered, release = asyncio.Event(), asyncio.Event()
+    first = incoming(kind, "first", "看看模型上下文")
+    second = incoming(kind, "second", "补充模型上下文的问题")
+    sent, prompts = [], []
+
+    async def judge(*args):
+        if phase == "judge" and not entered.is_set():
+            entered.set()
+            await release.wait()
+        return deepcopy(env.response)
+
+    env.plugin.client.evaluate.side_effect = judge
+
+    async def native_reply(event):
+        event.send = AsyncMock()
+        await env.plugin.on_input(event)
+        await env.plugin.on_message(event)
+        if event.is_stopped():
+            return
+        request, _ = await collect_request(
+            event,
+            env.ctx,
+            MainAgentBuildConfig(tool_call_timeout=30, provider_wake_prefix="!"),
+        )
+        assert request is not None
+        await env.plugin.restore_takeover_message(event, request)
+        await env.plugin.on_request(event, request)
+        assert event.message_str == request.prompt
+        if phase == "generate" and event is first:
+            entered.set()
+            await release.wait()
+        response = LLMResponse(role="assistant", completion_text="合成的合并回答")
+        await env.plugin.on_response(event, response)
+        event.set_result(event.plain_result(response.completion_text))
+        await env.plugin.before_output(event)
+        if not event.is_stopped():
+            await event.send(event.get_result())
+            sent.append(event)
+            prompts.append(request.prompt)
+
+    task = asyncio.create_task(native_reply(first))
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        await native_reply(second)
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+    assert sent == [second]
+    assert first.is_stopped()
+    assert second.get_extra("_jev_merged_message_ids") == ["first", "second"]
+    assert "[1] 看看模型上下文" in prompts[0]
+    assert "[2] 补充模型上下文的问题" in prompts[0]
+    assert not prompts[0].startswith("!")
+    assert env.plugin.metrics.replies == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_prefix_native_collector_keeps_images_and_restores_via_hook(
+    env, monkeypatch
+):
+    from astrbot.core.pipeline.context import call_event_hook
+    from astrbot.core.star.star import star_map
+    from astrbot.core.star.star_handler import EventType, star_handlers_registry
+    from ..main import JevActiveReply
+
+    env.cfg["takeover_wake_messages"] = True
+    env.settings["provider_settings"]["wake_prefix"] = "!"
+    ev = incoming("at")
+    original = ev.get_message_str()
+    attachment = Image.fromURL("https://example.invalid/synthetic.png")
+    ev.message_obj.message.append(attachment)
+    parts = list(ev.get_messages())
+    monkeypatch.setattr(
+        Image, "convert_to_file_path", AsyncMock(return_value="/test/synthetic.png")
+    )
+    await env.plugin.on_input(ev)
+    await env.plugin.on_message(ev)
+    request, _ = await collect_request(
+        ev,
+        env.ctx,
+        MainAgentBuildConfig(tool_call_timeout=30, provider_wake_prefix="!"),
+    )
+    assert request.prompt == original
+    assert request.image_urls == ["/test/synthetic.png"]
+    assert request.conversation.cid == env.cid
+    assert ev.get_messages() == parts
+    handler = JevActiveReply.restore_takeover_message
+    metadata = copy(
+        star_handlers_registry.get_handler_by_full_name(
+            handler.__module__ + "_restore_takeover_message"
+        )
+    )
+    assert metadata.event_type == EventType.OnLLMRequestEvent
+    assert metadata.extras_configs["priority"] == 1000000
+    metadata.handler = env.plugin.restore_takeover_message
+    monkeypatch.setitem(star_map, metadata.handler_module_path, NS(name="jev-test"))
+    monkeypatch.setattr(
+        star_handlers_registry, "get_handlers_by_event_type", lambda *a, **k: [metadata]
+    )
+    assert not await call_event_hook(ev, EventType.OnLLMRequestEvent, request)
+    assert ev.get_message_str() == original
+    assert request.prompt == original

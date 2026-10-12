@@ -87,6 +87,26 @@ class JevActiveReply(Star):
     def _lifetime(self):
         return min(180, max(15, float(self._cfg("request_lifetime_seconds", 90))))
 
+    @staticmethod
+    def _native_provider_prefix(settings):
+        # Match AgentRequestSubStage's removal of bot prefixes from the LLM prefix.
+        prefix = settings.get("provider_settings", {}).get("wake_prefix", "") or ""
+        for bot_prefix in settings.get("wake_prefix", []):
+            if prefix.startswith(bot_prefix):
+                prefix = prefix[len(bot_prefix) :]
+        return prefix
+
+    @staticmethod
+    def _restore_native_prefix(event):
+        meta = event.get_extra(MARK)
+        if meta and "native_prefix_original" in meta:
+            event.message_str = meta.pop("native_prefix_original")
+
+    @filter.on_llm_request(priority=1000000)
+    async def restore_takeover_message(self, event: AstrMessageEvent, req):
+        # Core has consumed the temporary prefix; other request hooks see the input.
+        self._restore_native_prefix(event)
+
     def _in_scope(self, event):
         if (
             self.closed
@@ -334,6 +354,7 @@ class JevActiveReply(Star):
         meta = event.get_extra(MARK)
         if not meta:
             return
+        self._restore_native_prefix(event)
         burst.close(event)
         lease = meta.pop("lease", None)
         if lease:
@@ -1212,9 +1233,10 @@ class JevActiveReply(Star):
             settings = self.context.get_config(umo=umo)
             provider_settings = settings.get("provider_settings", {})
             runner = settings.get("agent_runner", {}).get("runner_type", "local")
+            takeover = bool(event.get_extra("_jev_takeover"))
             if (
                 runner not in (None, "local")
-                or provider_settings.get("wake_prefix")
+                or (provider_settings.get("wake_prefix") and not takeover)
                 or (
                     not event.get_extra("_jev_takeover")
                     and any(
@@ -1254,8 +1276,15 @@ class JevActiveReply(Star):
                 },
             )
             event.set_extra("_active_trigger", True)
-            if event.get_extra("_jev_takeover"):
+            if takeover:
                 event.set_extra("enable_streaming", False)
+                prefix = self._native_provider_prefix(settings)
+                if prefix and not event.message_str.startswith(prefix):
+                    # Let Core collect media/history normally and strip its prefix.
+                    # Only this admitted event changes; shared settings stay intact.
+                    meta = event.get_extra(MARK)
+                    meta["native_prefix_original"] = event.message_str
+                    event.message_str = prefix + event.message_str
             self.pending_events[ticket] = event
             room.phase = "generating"
             self._install_sender(event)
@@ -1337,6 +1366,7 @@ class JevActiveReply(Star):
 
     @filter.on_llm_request(priority=-100)
     async def on_request(self, event: AstrMessageEvent, req):
+        self._restore_native_prefix(event)
         meta = event.get_extra(MARK)
         if not meta:
             return
