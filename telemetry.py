@@ -8,12 +8,15 @@ class Metrics:
     def __init__(self):
         self.decisions = self.replies = self.failures = 0
         self.latencies = Counter()
+        self.errors = Counter()
         self.transport_streak = 0
 
     def decision(self, latency_ms, error=None):
         self.decisions += 1
         self.latencies[max(0, min(180000, round(latency_ms)))] += 1
         self.failures += error is not None
+        if error is not None:
+            self.errors[error] += 1
         if error == "transport_uncertain":
             self.transport_streak += 1
         elif error not in {"no_capacity", "queue_full"}:

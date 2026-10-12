@@ -91,18 +91,24 @@ class JevActiveReply(Star):
         if (
             self.closed
             or not self._cfg("enabled", True)
-            or event.is_private_chat()
+            or (event.is_private_chat() and not self._cfg("enable_private_chat", False))
             or event.get_platform_name() != "aiocqhttp"
         ):
             return False
         allow = self._cfg("enabled_sessions", [])
-        umo, gid = event.unified_msg_origin, str(event.get_group_id())
-        return any(x in allow for x in ("*", umo, gid))
+        return any(x in allow for x in ("*", *self._session_targets(event)))
+
+    @staticmethod
+    def _session_targets(event):
+        return (
+            event.unified_msg_origin,
+            str(event.get_sender_id()) if event.is_private_chat() else str(event.get_group_id()),
+        )
 
     def _enabled(self, event):
         deny = self._cfg("disabled_sessions", [])
         return self._in_scope(event) and not any(
-            x in deny for x in (event.unified_msg_origin, str(event.get_group_id()))
+            x in deny for x in self._session_targets(event)
         )
 
     @staticmethod
@@ -267,9 +273,11 @@ class JevActiveReply(Star):
     def _summary_tick(self):
         if self.closed:
             return
+        errors = json.dumps(dict(sorted(self.metrics.errors.items())))
         logger.info(
-            "[JevActive] hourly summary decisions=%d replies=%d p95_latency_ms=%d failures=%d",
+            "[JevActive] hourly summary decisions=%d replies=%d p95_latency_ms=%d failures=%d failure_reasons=%s",
             *self.metrics.take(),
+            errors,
         )
         self.summary_timer = asyncio.get_running_loop().call_later(
             3600, self._summary_tick
@@ -278,6 +286,13 @@ class JevActiveReply(Star):
     async def _judge(self, event, state, questions):
         started, error = time.monotonic(), None
         try:
+            if self._cfg("relay_mode", "jev") == "astrbot":
+                provider_id = await self.context.get_current_chat_provider_id(
+                    umo=event.unified_msg_origin
+                )
+                return await self.client.evaluate_provider(
+                    state, questions, self.context, provider_id
+                )
             return await self.client.evaluate(state, questions)
         except asyncio.CancelledError:
             error = "cancelled"
@@ -677,7 +692,7 @@ class JevActiveReply(Star):
             "shadow" if self._cfg("dry_run", False) else "live",
         )
 
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=1000000)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE | filter.EventMessageType.PRIVATE_MESSAGE, priority=1000000)
     async def on_input(self, event: AstrMessageEvent):
         if event.get_extra("_jev_recall_notice"):
             return
@@ -686,7 +701,7 @@ class JevActiveReply(Star):
             or not self._cfg("enabled", True)
             or self._cfg("dry_run", False)
             or self._blocked(event)
-            or event.is_private_chat()
+            or (event.is_private_chat() and not self._cfg("enable_private_chat", False))
             or event.get_platform_name() != "aiocqhttp"
             or event.get_extra("_jev_recall_notice")
         ):
@@ -694,13 +709,20 @@ class JevActiveReply(Star):
         allow = self._cfg("enabled_sessions", [])
         if not any(
             value in allow
-            for value in ("*", event.unified_msg_origin, str(event.get_group_id()))
+            for value in ("*", *self._session_targets(event))
         ):
             return
         room = self.rooms.get(event.unified_msg_origin)
         if room is None:
             return
         settings = self.context.get_config(umo=event.unified_msg_origin)
+        # Core resolves command filters before running message handlers.
+        if (
+            (event.is_private_chat() or self._cfg("takeover_wake_messages", False))
+            and event.get_extra("handlers_parsed_params")
+        ):
+            event.set_extra("_jev_command_owned", True)
+            return
         action, reason = input_decision(
             event, self.config, room.last_text, settings.get("wake_prefix", [])
         )
@@ -723,9 +745,11 @@ class JevActiveReply(Star):
             ):
                 event.is_at_or_wake_command = False
         if reason == "management_command":
+            event.set_extra("_jev_command_owned", True)
             return
         # Registered commands keep their native permission and handler path.
         if event.get_extra("handlers_parsed_params"):
+            event.set_extra("_jev_command_owned", True)
             return
         if action == "skip" and not event.is_at_or_wake_command:
             return
@@ -758,6 +782,9 @@ class JevActiveReply(Star):
             room.quiet_senders.pop(sender, None)
             cooldown = max(0, min(10, float(self._cfg("direct_wake_interval", 0.5))))
             if (
+                not self._cfg("takeover_wake_messages", False)
+                and not event.is_private_chat()
+                and
                 not guard_exempt(event, self.config)
                 and now - room.direct_wakes.get(sender, -1e12) < cooldown
             ):
@@ -780,18 +807,44 @@ class JevActiveReply(Star):
             self._note(event, "sender_quiet")
 
     # Run after ContextAware and ordinary message handlers; no pre-emptive stop_event.
-    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=-1000)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE | filter.EventMessageType.PRIVATE_MESSAGE, priority=-1000)
     async def on_message(self, event: AstrMessageEvent):
+        if event.get_extra("_jev_command_owned") or event.get_extra("handlers_parsed_params"):
+            return
+        owned = (
+            self._enabled(event)
+            and not self._cfg("dry_run", False)
+            and not self._blocked(event)
+            and not event.get_extra("provider_request")
+            and not getattr(event, "call_llm", False)
+            and not getattr(event, "_has_send_oper", False)
+            and (
+                event.is_private_chat()
+                or (self._cfg("takeover_wake_messages", False) and event.is_at_or_wake_command)
+            )
+        )
+        if owned:
+            event.set_extra("_jev_takeover", True)
+            # Suppress the unapproved native wake; only an admitted Jev turn
+            # re-enables the single native generation tail below.
+            event.is_at_or_wake_command = False
+        try:
+            await self._on_message(event)
+        finally:
+            if owned and not event.get_extra(MARK):
+                event.stop_event()
+
+    async def _on_message(self, event):
         if (
             not self._enabled(event)
             or self._blocked(event)
             or event.get_extra("_jev_recall_notice")
         ):
             return
-        if event.get_extra("_jev_input_action") in ("skip", "block"):
+        if event.get_extra("_jev_input_action") in ("skip", "block") and not event.get_extra("_jev_takeover"):
             return
         plain = str(event.get_message_str() or "").strip()
-        if any(
+        if not event.get_extra("_jev_takeover") and any(
             prefix and plain.startswith(prefix)
             for prefix in self._cfg("skip_command_prefixes", ["/", "!"])
         ):
@@ -847,7 +900,7 @@ class JevActiveReply(Star):
             return
         if str(event.get_sender_id()) in self._cfg("other_bot_ids", []):
             return
-        if any(
+        if not event.get_extra("_jev_takeover") and any(
             type(p).__name__ == "Reply"
             and str(getattr(p, "sender_id", "")) == str(event.get_self_id())
             for p in event.get_messages()
@@ -1238,7 +1291,7 @@ class JevActiveReply(Star):
         if not meta["cid"]:
             meta["cid"] = str(getattr(req.conversation, "cid", ""))
         # Adapt only this request's scene; never change ContextAware's global state.
-        if meta["mode"] in ("continue", "respond"):
+        if meta["mode"] in ("continue", "respond") and not event.get_extra("_jev_takeover"):
             for part in req.extra_user_content_parts:
                 scene = getattr(part, "text", "")
                 if scene.strip().startswith("<conversation_scene>"):
@@ -1263,11 +1316,18 @@ class JevActiveReply(Star):
                 "未实际看图时不能猜图中细节。不要提及门控、评分或这段提示。"
                 "决定不说话时优先调用 keep_silent；工具不可用时只返回 [PASS]，不要向群里解释为什么沉默。"
             )
+            if event.get_extra("_jev_takeover"):
+                notice = (
+                    "这是经 Jev 判断的用户呼叫或私聊。按原文和合并后的补充内容回应，"
+                    "保持当前人设、记忆和生活状态；没有新内容时可以调用 keep_silent。"
+                    "未实际看图时不要猜图中细节，不要提及门控或评分。"
+                    "决定不说话时优先调用 keep_silent；工具不可用时只返回 [PASS]。"
+                )
             guidance = str(self._cfg("behavior_guidance", "")).strip()
             if guidance:
                 notice += "\n本插件自主轮行为补充（不改身份设定）：" + guidance
             req.extra_user_content_parts.append(TextPart(text=notice).mark_as_temp())
-            if meta["mode"] in ("continue", "respond"):
+            if meta["mode"] in ("continue", "respond") and not event.get_extra("_jev_takeover"):
                 req.extra_user_content_parts.append(
                     TextPart(
                         text=(
@@ -1844,11 +1904,11 @@ class JevActiveReply(Star):
             await asyncio.shield(self.audit_task)
         pools = [pool.status() for pool in self.client.pools.values()]
         lines = [
-            "Jev 主动回复插件 0.9.0 · 木有知",
+            "Jev 主动回复插件 0.10.0 · 木有知",
             f"当前群：{'已启用' if self._enabled(event) else '未启用'}",
         ]
         for p in pools:
-            name = {"nanbei": "南北绿豆站", "typesafe": "Jev 官方"}[p["channel"]]
+            name = {"nanbei": "南北绿豆站", "typesafe": "Jev 官方", "relay": "自定义中转"}[p["channel"]]
             lines.append(
                 f"{name}：{p['keys']} 枚 Key，失效 {p['disabled_keys']} 枚，正在判断 {p['in_flight']} 次"
             )
@@ -1873,7 +1933,7 @@ class JevActiveReply(Star):
         )
         if not await self.client.review_ready():
             lines.append(
-                "Jev 暂不可用，请检查所选渠道的 Key 和账户余额。主动接话暂停，正常 @ 和昵称呼叫不受影响；临时故障解除后可发送 jev恢复。"
+                "判断服务暂不可用，请检查所选服务的凭据和账户余额；故障解除后可发送 jev恢复。"
             )
         lines.append("本命令不请求上游，不展示 Key 或聊天正文。")
         yield event.plain_result("\n".join(lines))

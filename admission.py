@@ -89,7 +89,7 @@ def _sticker_image_ids(event, parts):
 
 
 def explicit_wake(event, config):
-    if getattr(event, "is_at_or_wake_command", False):
+    if getattr(event, "is_at_or_wake_command", False) or event.get_extra("_jev_takeover"):
         return True
     parts = event.get_messages()
     bot = str(event.get_self_id())

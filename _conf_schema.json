@@ -1,4 +1,48 @@
 {
+  "takeover_wake_messages": {
+    "type": "bool",
+    "default": false,
+    "description": "Jev 接管 @、昵称与前缀呼叫"
+  },
+  "enable_private_chat": {
+    "type": "bool",
+    "default": false,
+    "description": "私聊启用 Jev"
+  },
+  "relay_mode": {
+    "type": "string",
+    "default": "jev",
+    "options": ["jev", "astrbot", "custom"],
+    "labels": ["原有 Jev 渠道", "AstrBot 当前提供商", "自定义 OpenAI 中转"],
+    "description": "判断服务"
+  },
+  "relay": {
+    "type": "object",
+    "description": "自定义判断中转",
+    "condition": {"relay_mode": "custom"},
+    "items": {
+      "base_url": {
+        "type": "string",
+        "default": "",
+        "description": "HTTPS Base URL"
+      },
+      "api_key": {
+        "type": "string",
+        "default": "",
+        "description": "API Key"
+      },
+      "model": {
+        "type": "string",
+        "default": "",
+        "description": "模型"
+      },
+      "concurrency": {
+        "type": "int",
+        "default": 4,
+        "description": "中转并发上限"
+      }
+    }
+  },
   "enabled": {
     "type": "bool",
     "default": true,
@@ -8,8 +52,8 @@
   "enabled_sessions": {
     "type": "list",
     "default": [],
-    "description": "启用群聊",
-    "hint": "填写群号；填 * 表示所有群。",
+    "description": "启用会话",
+    "hint": "填写群号、私聊用户号或完整会话标识；填 * 表示全部。私聊需打开私聊开关。",
     "invisible": false
   },
   "primary_channel": {

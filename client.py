@@ -23,6 +23,30 @@ ENDPOINTS = {
 }
 
 
+def normalize_relay_url(base_url: str) -> str:
+    """Normalize OpenAI-compatible base URLs to chat completions."""
+    value = str(base_url or "").strip().rstrip("/")
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("relay base URL must be HTTPS without credentials/query")
+    path = parsed.path.rstrip("/")
+    if path.endswith("/v1/chat/completions"):
+        path = path[: -len("/chat/completions")]
+    elif path.endswith("/chat/completions"):
+        path = path[: -len("/chat/completions")]
+    if path.endswith("/v1"):
+        path = path[:-3]
+    path = path.rstrip("/")
+    return f"{parsed.scheme}://{parsed.netloc}{path}/v1/chat/completions"
+
+
 class DecisionError(Exception):
     """Safe public error: never contains headers, state, key, or response body."""
 
@@ -53,6 +77,12 @@ class Adapter:
 
     @classmethod
     def create(cls, kind: str, config: dict) -> Adapter:
+        if kind == "relay":
+            endpoint = normalize_relay_url(config.get("base_url", ""))
+            model = str(config.get("model") or "").strip()
+            if not model:
+                raise ValueError("relay model is required")
+            return cls(kind, endpoint, model)
         if kind not in ENDPOINTS:
             raise ValueError("unknown channel type")
         endpoint, model = ENDPOINTS[kind]
@@ -73,9 +103,41 @@ class Adapter:
 
     def encode(self, state: dict, questions: dict) -> dict:
         # Both contracts currently share typed primitives, but not URL/aliases/errors.
+        if self.kind == "relay":
+            prompt = (
+                "根据下面的状态，严格回答每个问题的概率。只返回 JSON 对象，"
+                "键为问题名，值为 0 到 1 的数字，不要附加说明。\n"
+                + json.dumps(
+                    {"state": state, "questions": questions},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+            return {
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"},
+            }
         return {"model": self.model, "state": state, "questions": questions}
 
     def decode(self, body: object, questions: dict) -> dict:
+        if self.kind == "relay":
+            try:
+                content = body["choices"][0]["message"]["content"]
+                decoded = json.loads(content) if isinstance(content, str) else content
+            except (KeyError, IndexError, TypeError, ValueError):
+                raise DecisionError("invalid_response") from None
+            body = {"answers": {}}
+            if isinstance(decoded, dict):
+                for name, question in questions.items():
+                    value = decoded.get(name)
+                    if isinstance(value, dict):
+                        body["answers"][name] = value
+                    else:
+                        body["answers"][name] = {
+                            "type": question["type"],
+                            "noul": value,
+                        }
         if not isinstance(body, dict) or not isinstance(body.get("answers"), dict):
             raise DecisionError("invalid_response")
         values = {}
@@ -105,7 +167,9 @@ class Adapter:
         if not isinstance(error, dict):
             error = {}
         code = error.get("code") or error.get("type")
-        if status == 403 and (not isinstance(body, dict) or code == "edge_blocked"):
+        if self.kind != "relay" and status == 403 and (
+            not isinstance(body, dict) or code == "edge_blocked"
+        ):
             return "edge_rejected", 60, True
         if self.kind == "nanbei" and status == 403:
             return "site_access_or_balance", 60, True
@@ -270,11 +334,14 @@ class KeyPool:
 class JevClient:
     def __init__(self, config: dict, transport=None, clock=time.monotonic):
         self.config = config
+        relay_mode = config.get("relay_mode", "jev")
+        if relay_mode not in {"jev", "astrbot", "custom"}:
+            raise ValueError("invalid relay_mode")
         primary = config.get("primary_channel", "nanbei")
         if primary not in ENDPOINTS:
             raise ValueError("invalid primary_channel")
-        self.order = [primary]
-        if config.get("allow_channel_fallback", False):
+        self.order = [] if relay_mode != "jev" else [primary]
+        if relay_mode == "jev" and config.get("allow_channel_fallback", False):
             self.order += [k for k in ENDPOINTS if k != primary]
         self.pools = {}
         for kind in self.order:
@@ -318,15 +385,38 @@ class JevClient:
         self.group_cursor = 0
         for pool in self.pools.values():
             pool.changed = self._notify
+        relay = config.get("relay", {})
+        if relay_mode == "custom":
+            key = str(relay.get("api_key") or "").strip()
+            model = str(relay.get("model") or "").strip()
+            if not key or not model:
+                raise ValueError("custom relay requires an API key and model")
+            adapter = Adapter.create("relay", relay)
+            self.pools["relay"] = KeyPool(
+                "relay",
+                {
+                    **relay,
+                    "keys": [key],
+                    "concurrency": relay.get("concurrency", 4),
+                },
+                clock,
+            )
+            self.pools["relay"].adapter = adapter
+            self.pools["relay"].changed = self._notify
 
     def _notify(self):
         self.revision += 1
         self.capacity_changed.set()
 
     async def review_ready(self):
+        if self.config.get("relay_mode") == "astrbot":
+            return not self.closed
         for pool in self.pools.values():
             await pool.restore_health()
-            if pool.adapter.kind not in self.order or pool.until > pool.clock():
+            if (
+                pool.adapter.kind not in self.order
+                and not (self.config.get("relay_mode") == "custom" and pool.adapter.kind == "relay")
+            ) or pool.until > pool.clock():
                 continue
             if not any(not math.isinf(key.until) for key in pool.keys):
                 continue
@@ -387,6 +477,12 @@ class JevClient:
                             if key is not None:
                                 self.group_cursor += 1
                                 return pool, key
+                    if self.config.get("relay_mode") == "custom":
+                        relay_pool = self.pools.get("relay")
+                        if relay_pool:
+                            key = await relay_pool.acquire()
+                            if key is not None:
+                                return relay_pool, key
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
@@ -432,7 +528,7 @@ class JevClient:
             json=payload,
             headers={
                 "Authorization": f"Bearer {key}",
-                "User-Agent": "JevActiveReply/0.9.0",
+                "User-Agent": "JevActiveReply/0.10.0",
             },
             allow_redirects=False,
         ) as response:
@@ -462,7 +558,11 @@ class JevClient:
             # Never retry timeouts, disconnects, malformed successes or ambiguous 5xx.
             wire_size = len(
                 json.dumps(
-                    {"model": "jev-latest", "state": state, "questions": questions},
+                    (
+                        {"model": "jev-latest", "state": state, "questions": questions}
+                        if self.config.get("relay_mode") != "custom"
+                        else {"model": self.config["relay"].get("model"), "state": state, "questions": questions}
+                    ),
                     ensure_ascii=False,
                 ).encode()
             )
@@ -508,6 +608,38 @@ class JevClient:
             finally:
                 await pool.release(key, cooldown, shared)
         raise DecisionError("no_capacity")
+
+    async def evaluate_provider(self, state, questions, context, provider_id):
+        if self.closed:
+            raise DecisionError("client_closed")
+        try:
+            state = fit_state(state, questions, self.config)
+        except ValueError:
+            raise DecisionError("protected_context_exceeds_safety_budget") from None
+        adapter = Adapter("relay", "", "")
+        payload = adapter.encode(state, questions)
+        if len(json.dumps(payload, ensure_ascii=False).encode()) > self.max_body:
+            raise DecisionError("request_budget_exceeded")
+        try:
+            response = await asyncio.wait_for(
+                context.llm_generate(
+                    chat_provider_id=provider_id,
+                    prompt=payload["messages"][0]["content"],
+                    contexts=[],
+                    tools=None,
+                    response_format={"type": "json_object"},
+                ),
+                self.timeout,
+            )
+        except asyncio.TimeoutError:
+            raise DecisionError("transport_uncertain") from None
+        except Exception:
+            raise DecisionError("provider_error") from None
+        text = str(response.completion_text or "")
+        if len(text.encode()) > 262144:
+            raise DecisionError("response_too_large")
+        result = adapter.decode({"choices": [{"message": {"content": text}}]}, questions)
+        return {**result, "channel": "astrbot", "key_id": "provider"}
 
     async def close(self):
         self.closed = True
