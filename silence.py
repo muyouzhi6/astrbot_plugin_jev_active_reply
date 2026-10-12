@@ -4,8 +4,10 @@ from collections import OrderedDict, deque
 import json
 import re
 import time
+import unicodedata
 
 from astrbot.api.message_components import Plain
+from astrbot.core.message.message_event_result import MessageChain
 
 SILENT = "_jev_silent_requested"
 RECALL = "_recall_stop_requested"
@@ -17,33 +19,45 @@ FALLBACK_REPLY = "我在，请再说一下你的问题。"
 def repair_required_reply(response=None, result=None):
     """Remove silence markers without starting a second generation or send."""
     if response is not None:
+        if response.result_chain is None:
+            response.result_chain = MessageChain(
+                [Plain(response.completion_text or "")]
+            )
         result = response.result_chain
-    text = str(response.completion_text or "") if response is not None else ""
-    parts = result.chain if result is not None else []
-    if not MARKER.search(text) and not any(
-        isinstance(part, Plain) and MARKER.search(part.text) for part in parts
-    ):
+    if result is None:
         return
-
-    def clean(value):
-        cleaned = MARKER.sub("", value).strip()
-        if MARKER.search(value) and not cleaned.strip("。.!！?？,，;；:： \t\r\n"):
-            return ""
-        return cleaned
-
-    for part in parts:
-        if isinstance(part, Plain):
-            part.text = clean(part.text)
-    parts[:] = [part for part in parts if not isinstance(part, Plain) or part.text]
-    reply = (
-        clean(text)
-        or "".join(part.text for part in parts if isinstance(part, Plain)).strip()
-        or FALLBACK_REPLY
-    )
-    if response is not None:
-        response.completion_text = reply
-    if result is not None and not any(isinstance(part, Plain) for part in parts):
-        parts.insert(0, Plain(reply))
+    parts = result.chain
+    plains = [part for part in parts if isinstance(part, Plain)]
+    # Match the full text to catch markers split across Plain components, then
+    # remove only their spans in each original component. The completion_text
+    # setter would collapse all Plain components ahead of intervening media.
+    text = "".join(part.text for part in plains)
+    spans = [match.span() for match in MARKER.finditer(text)]
+    offset = 0
+    for part in plains:
+        value, end = part.text, offset + len(part.text)
+        cursor, kept = 0, []
+        for start, stop in spans:
+            if start < end and stop > offset:
+                kept.append(value[cursor : max(0, start - offset)])
+                cursor = min(len(value), stop - offset)
+        kept.append(value[cursor:])
+        part.text = "".join(kept)
+        offset = end
+    cleaned = "".join(part.text for part in plains)
+    if not any(
+        not char.isspace() and not unicodedata.category(char).startswith(("P", "C"))
+        for char in cleaned
+    ):
+        if plains:
+            plains[0].text = FALLBACK_REPLY
+            for part in plains[1:]:
+                part.text = ""
+        else:
+            parts.insert(0, Plain(FALLBACK_REPLY))
+    parts[:] = [
+        part for part in parts if not isinstance(part, Plain) or part.text.strip()
+    ]
 
 
 def values(config, key):

@@ -546,6 +546,10 @@ class JevActiveReply(Star):
                 return None
             if not await self._permit(event):
                 raise DeliveryDeclined("autonomous_delivery_cancelled")
+            # A decorator may replace the result or send its own chain after
+            # our hooks. Clean the actual outgoing chain at the last send point.
+            if self._must_reply(event) and hasattr(chain, "chain"):
+                silence.repair_required_reply(result=chain)
             meta = event.get_extra(MARK)
             token = nested.set(task)
             meta["send_depth"] = meta.get("send_depth", 0) + 1
@@ -1062,7 +1066,9 @@ class JevActiveReply(Star):
                 and (required or generation == room.generation)
                 and not self._blocked(event)
             ):
-                remaining = deadline - time.monotonic()
+                # Required replies stay queued until the current room owner
+                # finishes. Natural candidates retain their bounded wait.
+                remaining = 0.5 if required else deadline - time.monotonic()
                 if remaining <= 0:
                     self._note(event, "candidate_wait_expired")
                     return
@@ -1070,7 +1076,7 @@ class JevActiveReply(Star):
                 try:
                     await asyncio.wait_for(signal.wait(), min(remaining, 0.5))
                 except asyncio.TimeoutError:
-                    if time.monotonic() >= deadline:
+                    if not required and time.monotonic() >= deadline:
                         self._note(event, "candidate_wait_expired")
                         return
             if (not required and generation != room.generation) or self._blocked(event):
@@ -1862,6 +1868,13 @@ class JevActiveReply(Star):
         if not meta:
             return
         result = event.get_result()
+        if (
+            result is not None
+            and not meta.get("sent_parts")
+            and not self._blocked(event)
+            and self._must_reply(event)
+        ):
+            silence.repair_required_reply(result=result)
         if self._blocked(event) or not result or not result.chain:
             self._release(event)
             meta["finished"] = True
