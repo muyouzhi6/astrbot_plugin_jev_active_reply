@@ -126,6 +126,7 @@ class RoomBook:
 
 class Ledger:
     def __init__(self, path):
+        self.path = path
         self.lock = threading.RLock()
         self.closed = False
         self.db = sqlite3.connect(path, check_same_thread=False)
@@ -189,6 +190,10 @@ class Ledger:
                 "elapsed_ms",
                 "stage_ms",
                 "trigger_preview",
+                "ingress_id",
+                "sender_hash",
+                "send_sequence",
+                "receipt_id",
             )
         }
         if "trigger_preview" in allowed:
@@ -255,6 +260,24 @@ class Ledger:
 
     async def acooldown(self, scope, until=None):
         return await asyncio.to_thread(self.cooldown, scope, until)
+
+    async def read_quiet(self, scope):
+        """Retry policy reads independently of a failing accounting connection."""
+
+        def read():
+            from pathlib import Path
+
+            uri = Path(self.path).resolve().as_uri() + "?mode=ro"
+            db = sqlite3.connect(uri, uri=True, timeout=0.5)
+            try:
+                row = db.execute(
+                    "SELECT until FROM cooldowns WHERE scope=?", (scope,)
+                ).fetchone()
+                return row[0] if row else 0
+            finally:
+                db.close()
+
+        return await asyncio.to_thread(read)
 
     def close(self):
         with self.lock:

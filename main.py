@@ -284,6 +284,11 @@ class JevActiveReply(Star):
         if self.closed:
             return
         meta = event.get_extra(MARK)
+        details = {
+            **(details or {}),
+            "ingress_id": scope_id(str(getattr(event.message_obj, "message_id", ""))),
+            "sender_hash": scope_id(str(event.get_sender_id())),
+        }
         if meta:
             details = {
                 **(details or {}),
@@ -462,7 +467,11 @@ class JevActiveReply(Star):
         send = event.get_extra("_jev_context_failure_sender")
         if (
             not send
-            or not event.get_extra("_jev_context_unavailable")
+            or not (
+                event.get_extra("_jev_context_unavailable")
+                or event.get_extra("_jev_admission_failed")
+            )
+            or event.get_extra("_jev_quiet_unavailable")
             or event.get_extra("_jev_context_failure_attempted")
             or self.closed
             or self._blocked(event)
@@ -475,7 +484,12 @@ class JevActiveReply(Star):
         # No conversation-dependent draft may escape while storage is unavailable.
         # Record the attempt before transport; an ambiguous failure is not retried.
         event.set_extra("_jev_context_failure_attempted", True)
-        await send(event.plain_result(silence.FALLBACK_REPLY))
+        if meta and getattr(event, "bot", None) is not None:
+            await send(event.plain_result(silence.FALLBACK_REPLY))
+        else:
+            await self._send_audited(
+                event, send, (event.plain_result(silence.FALLBACK_REPLY),), {}
+            )
         if meta:
             await self._accepted(event)
         burst.close(event)
@@ -535,9 +549,20 @@ class JevActiveReply(Star):
     async def _load_quiet(self, event, room):
         async with room.quiet_lock:
             if not room.quiet_loaded:
-                until = await self.ledger.acooldown(
-                    "room_quiet:" + scope_id(event.unified_msg_origin)
-                )
+                scope = "room_quiet:" + scope_id(event.unified_msg_origin)
+                try:
+                    until = await self.ledger.acooldown(scope)
+                except Exception:
+                    if not self._takes_wakes(event):
+                        raise
+                    try:
+                        until = await self.ledger.read_quiet(scope)
+                    except Exception:
+                        event.set_extra("_jev_quiet_unavailable", True)
+                        event.stop_event()
+                        self._note(event, "quiet_policy_unavailable")
+                        raise
+                event.set_extra("_jev_quiet_unavailable", False)
                 room.quiet_until = (
                     time.monotonic() + max(0, until - time.time()) if until else 0
                 )
@@ -587,6 +612,22 @@ class JevActiveReply(Star):
             self._note(event, "delivery_counter_unavailable")
         self._note(event, "adapter_send_completed")
 
+    async def _send_audited(self, event, operation, args, kwargs):
+        sequence = event.get_extra("_jev_send_sequence", 0) + 1
+        event.set_extra("_jev_send_sequence", sequence)
+        details = {"send_sequence": sequence}
+        self._note(event, "send_attempt", details)
+        try:
+            result = await operation(*args, **kwargs)
+        except BaseException:
+            self._note(event, "send_failed", details)
+            raise
+        receipt = result.get("message_id") if isinstance(result, dict) else None
+        if isinstance(receipt, (str, int)):
+            details = {**details, "receipt_id": str(receipt)[:128]}
+        self._note(event, "send_completed", details)
+        return result
+
     def _install_sender(self, event):
         original_send = event.send
         nested = ContextVar("jev_delivery_owner", default=None)
@@ -624,6 +665,8 @@ class JevActiveReply(Star):
             nonlocal pending
             task = asyncio.current_task()
             if nested.get() is task:
+                if native:
+                    return await self._send_audited(event, operation, args, kwargs)
                 return await operation(*args, **kwargs)
             # Core emits tool-call status chains while the agent is running.
             # They are progress notifications, not the approved final reply.
@@ -778,7 +821,10 @@ class JevActiveReply(Star):
                 frame.sending += 1
             self.tasks.add(task)
             try:
-                result = await operation(*args, **kwargs)
+                if native or getattr(event, "bot", None) is None:
+                    result = await self._send_audited(event, operation, args, kwargs)
+                else:
+                    result = await operation(*args, **kwargs)
             except BaseException:
                 self._reject(event, None, "delivery_failed_or_cancelled")
                 raise
@@ -1152,6 +1198,11 @@ class JevActiveReply(Star):
             event.is_at_or_wake_command = False
         try:
             await self._on_message(event)
+        except Exception:
+            if not owned:
+                raise
+            event.set_extra("_jev_admission_failed", True)
+            self._note(event, "admission_failed")
         finally:
             if not event.get_extra(MARK):
                 await self._context_failure_reply(event)
@@ -1331,7 +1382,12 @@ class JevActiveReply(Star):
                 if remaining <= 0:
                     self._note(event, "candidate_wait_expired")
                     if required:
-                        await event.send(event.plain_result(silence.FALLBACK_REPLY))
+                        await self._send_audited(
+                            event,
+                            event.send,
+                            (event.plain_result(silence.FALLBACK_REPLY),),
+                            {},
+                        )
                         burst.close(event)
                         event.stop_event()
                         self._note(event, "candidate_timeout_replied")
@@ -1352,6 +1408,8 @@ class JevActiveReply(Star):
             # Do not log repr(exc): providers may include tokens or chat state.
             logger.warning("[JevActive] decision skipped (%s)", type(exc).__name__)
             self._note(event, "internal_error")
+            if required:
+                event.set_extra("_jev_admission_failed", True)
         finally:
             event.set_extra("_jev_candidate_running", False)
             self.tasks.discard(task)
@@ -1466,7 +1524,12 @@ class JevActiveReply(Star):
                 state["activity"]["last_reply_to"] = ""
             if (not required and generation != room.generation) or self._blocked(event):
                 return
-            await self.ledger.abump(umo, evaluation_kind)
+            try:
+                await self.ledger.abump(umo, evaluation_kind)
+            except Exception:
+                if not required:
+                    raise
+                self._note(event, "evaluation_counter_unavailable")
             active = bool(
                 room.last_sent
                 and now - room.last_sent
