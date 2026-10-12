@@ -871,6 +871,7 @@ class JevActiveReply(Star):
             return
         owned = (
             self._enabled(event)
+            and self._native_runner_is_local(event)
             and not self._cfg("dry_run", False)
             and not self._blocked(event)
             and not event.get_extra("provider_request")
@@ -898,6 +899,24 @@ class JevActiveReply(Star):
                 MARK
             ):
                 event.stop_event()
+
+    @staticmethod
+    def _runner_type(settings):
+        """Agent runner type across AstrBot config shapes (4.28 and 4.26)."""
+        settings = settings or {}
+        runner = (settings.get("agent_runner") or {}).get("runner_type")
+        if runner in (None, ""):
+            runner = (settings.get("provider_settings") or {}).get("agent_runner_type")
+        return runner or "local"
+
+    def _native_runner_is_local(self, event):
+        # Third-party runners (Dify/Coze/...) keep their native wake path:
+        # Jev cannot re-arm them, so never revoke their wake in the first place.
+        try:
+            settings = self.context.get_config(umo=event.unified_msg_origin)
+        except Exception:
+            return False
+        return self._runner_type(settings) == "local"
 
     async def _on_message(self, event):
         if (
@@ -1232,7 +1251,7 @@ class JevActiveReply(Star):
                 return
             settings = self.context.get_config(umo=umo)
             provider_settings = settings.get("provider_settings", {})
-            runner = settings.get("agent_runner", {}).get("runner_type", "local")
+            runner = self._runner_type(settings)
             takeover = bool(event.get_extra("_jev_takeover"))
             if (
                 runner not in (None, "local")
