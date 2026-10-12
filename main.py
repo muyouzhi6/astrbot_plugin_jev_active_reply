@@ -532,7 +532,7 @@ class JevActiveReply(Star):
         original_send = event.send
         nested = ContextVar("jev_delivery_owner", default=None)
 
-        async def send_operation(operation, *args, **kwargs):
+        async def send_operation(operation, args, kwargs, native=False):
             task = asyncio.current_task()
             if nested.get() is task:
                 return await operation(*args, **kwargs)
@@ -546,11 +546,31 @@ class JevActiveReply(Star):
                 return None
             if not await self._permit(event):
                 raise DeliveryDeclined("autonomous_delivery_cancelled")
+            meta = event.get_extra(MARK)
             # A decorator may replace the result or send its own chain after
             # our hooks. Clean the actual outgoing chain at the last send point.
-            if self._must_reply(event) and hasattr(chain, "chain"):
-                silence.repair_required_reply(result=chain)
-            meta = event.get_extra(MARK)
+            if self._must_reply(event):
+                if not native and hasattr(chain, "chain"):
+                    silence.repair_required_reply(
+                        result=chain, fallback=not meta.get("sent_parts")
+                    )
+                    # Core can send Record first, then a marker-only remainder.
+                    if not silence.has_reply_content(chain.chain):
+                        return None
+                if native:
+                    for key in ("message", "messages"):
+                        if key in kwargs:
+                            kwargs[key] = silence.repair_native_reply(
+                                kwargs[key], forward=key == "messages"
+                            )
+                    # CQHttp.send(event, message) also accepts positional content.
+                    # call_action has only the action name before keyword params.
+                    if len(args) > 1:
+                        args = (
+                            args[0],
+                            silence.repair_native_reply(args[1]),
+                            *args[2:],
+                        )
             token = nested.set(task)
             meta["send_depth"] = meta.get("send_depth", 0) + 1
             frame = event.get_extra(burst.FRAME)
@@ -573,11 +593,14 @@ class JevActiveReply(Star):
                 self.tasks.discard(task)
 
         async def send(chain, *args, **kwargs):
-            return await send_operation(original_send, chain, *args, **kwargs)
+            return await send_operation(original_send, (chain, *args), kwargs)
+
+        async def native_send(operation, *args, **kwargs):
+            return await send_operation(operation, args, kwargs, native=True)
 
         event.send = send
         if getattr(event, "bot", None) is not None:
-            event.bot = EventBotProxy(event.bot, send_operation)
+            event.bot = EventBotProxy(event.bot, native_send)
         self.split_adapters.attach(
             bridge.instance(self.context, event, "astrbot_plugin_output_patch")
         )
@@ -1666,7 +1689,11 @@ class JevActiveReply(Star):
         if required:
             silence.repair_required_reply(response=response)
             text = str(response.completion_text or "").strip()
-        if is_refusal(text) or not text:
+        if (is_refusal(text) or not text) and not (
+            required
+            and response.result_chain is not None
+            and silence.has_reply_content(response.result_chain.chain)
+        ):
             self._reject(event, response, "silent_or_cancelled")
             return
         room = self.rooms.rooms.get(event.unified_msg_origin)
