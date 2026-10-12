@@ -1,6 +1,7 @@
 """Event-scoped delivery control with a transparent Core completion adapter."""
 
 import copy
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import wraps
 from types import SimpleNamespace
@@ -125,8 +126,8 @@ def _native_segments(value, *, auto_escape=False):
 
 
 @dataclass
-class QueuedDelivery:
-    """Queue acknowledgement, not a platform receipt; resolved at turn completion."""
+class QueuedDelivery(Mapping):
+    """Deferred receipt mapping; platform fields appear after turn completion."""
 
     action: str
     args: tuple
@@ -141,6 +142,49 @@ class QueuedDelivery:
         return _native_segments(
             value, auto_escape=self.params.get("auto_escape", False)
         )
+
+    def __getitem__(self, key):
+        if not isinstance(self.receipt, Mapping):
+            raise KeyError(key)
+        return self.receipt[key]
+
+    def __iter__(self):
+        if isinstance(self.receipt, Mapping):
+            return iter(self.receipt)
+        return iter(())
+
+    def __len__(self):
+        return len(self.receipt) if isinstance(self.receipt, Mapping) else 0
+
+
+def install_send_tool_adapter(mark):
+    """Route the Core built-in current-session tool through Jev's event queue."""
+    from astrbot.core.tools.message_tools import SendMessageToUserTool
+
+    original = SendMessageToUserTool.call
+    if getattr(original, "_jev_send_tool", False):
+        return
+
+    @wraps(original)
+    async def call(tool, run_context, **kwargs):
+        event = getattr(run_context.context, "event", None)
+        if (
+            event is None
+            or not event.get_extra(mark)
+            or not event.get_extra("_jev_complete_output")
+        ):
+            return await original(tool, run_context, **kwargs)
+        agent_context = copy.copy(run_context.context)
+        agent_context.context = ScopedContext(agent_context.context, event)
+        scoped_context = copy.copy(run_context)
+        scoped_context.context = agent_context
+        result = await original(tool, scoped_context, **kwargs)
+        if isinstance(result, str) and result.startswith("Message sent to session "):
+            event.set_extra("_jev_tool_delivery", True)
+        return result
+
+    call._jev_send_tool = True
+    SendMessageToUserTool.call = call
 
 
 def native_delivery(event, action, args, params):
@@ -227,7 +271,8 @@ class ScopedContext:
     async def send_message(self, umo, chain, **kwargs):
         if str(umo) != str(self._event.unified_msg_origin):
             raise DeliveryDeclined("autonomous_cross_session_send")
-        return await self._event.send(chain)
+        await self._event.send(chain)
+        return True
 
 
 class SplitAdapters:

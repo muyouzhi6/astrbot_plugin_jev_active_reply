@@ -36,6 +36,7 @@ from .delivery import (
     native_delivery,
     SplitAdapters,
     install_completion_adapter,
+    install_send_tool_adapter,
     plan_onebot,
 )
 from .policy import (
@@ -89,6 +90,7 @@ class JevActiveReply(Star):
         self.metrics = Metrics()
         self.summary_timer = None
         install_completion_adapter()
+        install_send_tool_adapter(MARK)
 
     def _cfg(self, key, default):
         return self.config.get(key, default)
@@ -1808,6 +1810,14 @@ class JevActiveReply(Star):
                 if expired:
                     meta["created"] = time.monotonic()
                 flush = event.get_extra("_jev_flush_output")
+                buffered = event.get_extra("_jev_buffered_content", lambda: False)()
+                if event.get_extra("_jev_tool_delivery") and buffered:
+                    event.set_result(event.chain_result([]))
+                elif not buffered and not self._blocked(event):
+                    result = event.get_result()
+                    if result is not None and result.chain:
+                        await event.send(result)
+                        event.set_result(event.chain_result([]))
                 if flush and not self._blocked(event):
                     await flush()
                 if not meta.get("sent_parts") and not self._blocked(event):
@@ -2281,6 +2291,13 @@ class JevActiveReply(Star):
             return
         result = event.get_result()
         if self._must_reply(event):
+            if (
+                event.get_extra("_jev_tool_delivery")
+                and event.get_extra("_jev_buffered_content", lambda: False)()
+            ):
+                event.set_result(event.chain_result([]))
+                meta["output_ready"] = False
+                return
             await self._wait_delivery(meta)
             silence.repair_required_reply(
                 result=result,
