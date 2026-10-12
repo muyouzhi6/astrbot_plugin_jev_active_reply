@@ -9,13 +9,16 @@ class Metrics:
         self.decisions = self.replies = self.failures = 0
         self.latencies = Counter()
         self.errors = Counter()
+        self.cancelled = 0
+        self.outcomes = Counter()
         self.transport_streak = 0
 
     def decision(self, latency_ms, error=None):
         self.decisions += 1
         self.latencies[max(0, min(180000, round(latency_ms)))] += 1
-        self.failures += error is not None
-        if error is not None:
+        self.cancelled += error == "cancelled"
+        self.failures += error is not None and error != "cancelled"
+        if error is not None and error != "cancelled":
             self.errors[error] += 1
         if error == "transport_uncertain":
             self.transport_streak += 1
@@ -33,4 +36,7 @@ class Metrics:
         result = self.decisions, self.replies, p95, self.failures
         self.decisions = self.replies = self.failures = 0
         self.latencies.clear()
+        self.errors.clear()
+        self.cancelled = 0
+        self.outcomes.clear()
         return result

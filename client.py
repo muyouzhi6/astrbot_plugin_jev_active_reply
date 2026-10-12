@@ -26,7 +26,11 @@ ENDPOINTS = {
 def normalize_relay_url(base_url: str) -> str:
     """Normalize OpenAI-compatible base URLs to chat completions."""
     value = str(base_url or "").strip().rstrip("/")
-    parsed = urlsplit(value)
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        raise ValueError("invalid relay base URL") from None
     if (
         parsed.scheme != "https"
         or not parsed.hostname
@@ -34,6 +38,8 @@ def normalize_relay_url(base_url: str) -> str:
         or parsed.password
         or parsed.query
         or parsed.fragment
+        or any(c.isspace() or ord(c) < 32 for c in value)
+        or (port is not None and port == 0)
     ):
         raise ValueError("relay base URL must be HTTPS without credentials/query")
     path = parsed.path.rstrip("/")
@@ -127,7 +133,7 @@ class Adapter:
                 decoded = json.loads(content) if isinstance(content, str) else content
             except (KeyError, IndexError, TypeError, ValueError):
                 raise DecisionError("invalid_response") from None
-            body = {"answers": {}}
+            body = {"answers": {}, "model": self.model}
             if isinstance(decoded, dict):
                 for name, question in questions.items():
                     value = decoded.get(name)
@@ -167,8 +173,10 @@ class Adapter:
         if not isinstance(error, dict):
             error = {}
         code = error.get("code") or error.get("type")
-        if self.kind != "relay" and status == 403 and (
-            not isinstance(body, dict) or code == "edge_blocked"
+        if (
+            self.kind != "relay"
+            and status == 403
+            and (not isinstance(body, dict) or code == "edge_blocked")
         ):
             return "edge_rejected", 60, True
         if self.kind == "nanbei" and status == 403:
@@ -340,8 +348,10 @@ class JevClient:
         primary = config.get("primary_channel", "nanbei")
         if primary not in ENDPOINTS:
             raise ValueError("invalid primary_channel")
-        self.order = [] if relay_mode != "jev" else [primary]
-        if relay_mode == "jev" and config.get("allow_channel_fallback", False):
+        self.order = [primary] if relay_mode == "jev" else []
+        if relay_mode == "custom" and config.get("allow_channel_fallback", False):
+            self.order = [primary]
+        if self.order and config.get("allow_channel_fallback", False):
             self.order += [k for k in ENDPOINTS if k != primary]
         self.pools = {}
         for kind in self.order:
@@ -383,6 +393,8 @@ class JevClient:
         self.revision = 0
         self.capacity_changed = asyncio.Event()
         self.group_cursor = 0
+        self.provider_slots = asyncio.Semaphore(4)
+        self.provider_waiters = 0
         for pool in self.pools.values():
             pool.changed = self._notify
         relay = config.get("relay", {})
@@ -403,6 +415,7 @@ class JevClient:
             )
             self.pools["relay"].adapter = adapter
             self.pools["relay"].changed = self._notify
+            self.order.insert(0, "relay")
 
     def _notify(self):
         self.revision += 1
@@ -413,10 +426,7 @@ class JevClient:
             return not self.closed
         for pool in self.pools.values():
             await pool.restore_health()
-            if (
-                pool.adapter.kind not in self.order
-                and not (self.config.get("relay_mode") == "custom" and pool.adapter.kind == "relay")
-            ) or pool.until > pool.clock():
+            if pool.adapter.kind not in self.order or pool.until > pool.clock():
                 continue
             if not any(not math.isinf(key.until) for key in pool.keys):
                 continue
@@ -477,12 +487,6 @@ class JevClient:
                             if key is not None:
                                 self.group_cursor += 1
                                 return pool, key
-                    if self.config.get("relay_mode") == "custom":
-                        relay_pool = self.pools.get("relay")
-                        if relay_pool:
-                            key = await relay_pool.acquire()
-                            if key is not None:
-                                return relay_pool, key
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
@@ -558,11 +562,7 @@ class JevClient:
             # Never retry timeouts, disconnects, malformed successes or ambiguous 5xx.
             wire_size = len(
                 json.dumps(
-                    (
-                        {"model": "jev-latest", "state": state, "questions": questions}
-                        if self.config.get("relay_mode") != "custom"
-                        else {"model": self.config["relay"].get("model"), "state": state, "questions": questions}
-                    ),
+                    {"model": "jev-latest", "state": state, "questions": questions},
                     ensure_ascii=False,
                 ).encode()
             )
@@ -605,11 +605,18 @@ class JevClient:
             except asyncio.CancelledError:
                 cooldown = 0
                 raise
+            except DecisionError:
+                raise
+            except Exception:
+                if pool.adapter.kind != "relay":
+                    raise
+                cooldown = 15
+                raise DecisionError("transport_uncertain") from None
             finally:
                 await pool.release(key, cooldown, shared)
         raise DecisionError("no_capacity")
 
-    async def evaluate_provider(self, state, questions, context, provider_id):
+    async def evaluate_provider(self, state, questions, context, umo):
         if self.closed:
             raise DecisionError("client_closed")
         try:
@@ -620,25 +627,70 @@ class JevClient:
         payload = adapter.encode(state, questions)
         if len(json.dumps(payload, ensure_ascii=False).encode()) > self.max_body:
             raise DecisionError("request_budget_exceeded")
+        if self.provider_waiters >= 64:
+            raise DecisionError("queue_full")
+        self.provider_waiters += 1
+        acquired = False
         try:
-            response = await asyncio.wait_for(
-                context.llm_generate(
+            queue_seconds = min(
+                10,
+                max(
+                    0,
+                    float(
+                        self.config.get(
+                            "review_queue_seconds"
+                            if "candidate_reply" in state
+                            else "decision_queue_seconds",
+                            4 if "candidate_reply" in state else 1,
+                        )
+                    ),
+                ),
+            )
+            if not self.provider_slots.locked():
+                await self.provider_slots.acquire()
+            else:
+                try:
+                    await asyncio.wait_for(self.provider_slots.acquire(), queue_seconds)
+                except asyncio.TimeoutError:
+                    raise DecisionError("no_capacity") from None
+            acquired = True
+            if self.closed:
+                raise DecisionError("client_closed")
+
+            async def generate():
+                provider_id = await context.get_current_chat_provider_id(umo=umo)
+                if not provider_id:
+                    raise DecisionError("provider_unavailable")
+                return await context.llm_generate(
                     chat_provider_id=provider_id,
                     prompt=payload["messages"][0]["content"],
                     contexts=[],
                     tools=None,
                     response_format={"type": "json_object"},
-                ),
-                self.timeout,
-            )
-        except asyncio.TimeoutError:
-            raise DecisionError("transport_uncertain") from None
-        except Exception:
-            raise DecisionError("provider_error") from None
-        text = str(response.completion_text or "")
+                )
+
+            try:
+                response = await asyncio.wait_for(generate(), self.timeout)
+            except DecisionError:
+                raise
+            except (asyncio.TimeoutError, aiohttp.ClientError):
+                raise DecisionError("transport_uncertain") from None
+            except Exception as exc:
+                status = getattr(exc, "status_code", None)
+                if isinstance(status, int):
+                    code, _, _ = adapter.classify(status, None, {})
+                    raise DecisionError(code, status) from None
+                raise DecisionError("provider_error") from None
+        finally:
+            self.provider_waiters -= 1
+            if acquired:
+                self.provider_slots.release()
+        text = str(getattr(response, "completion_text", "") or "")
         if len(text.encode()) > 262144:
             raise DecisionError("response_too_large")
-        result = adapter.decode({"choices": [{"message": {"content": text}}]}, questions)
+        result = adapter.decode(
+            {"choices": [{"message": {"content": text}}]}, questions
+        )
         return {**result, "channel": "astrbot", "key_id": "provider"}
 
     async def close(self):

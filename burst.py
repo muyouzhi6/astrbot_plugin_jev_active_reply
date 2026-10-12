@@ -23,6 +23,7 @@ class BurstFrame:
     closed: bool = False
     committed: bool = False
     sending: int = 0
+    takeover: bool = False
 
 
 class BurstBook:

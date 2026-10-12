@@ -2,12 +2,14 @@
   "takeover_wake_messages": {
     "type": "bool",
     "default": false,
-    "description": "Jev 接管 @、昵称与前缀呼叫"
+    "description": "Jev 接管 @、昵称与前缀呼叫",
+    "hint": "开启后先判断再回复，连续补充参与合并；已注册的命令继续交给 AstrBot。"
   },
   "enable_private_chat": {
     "type": "bool",
     "default": false,
-    "description": "私聊启用 Jev"
+    "description": "私聊启用 Jev",
+    "hint": "私聊用户号或完整会话标识也需加入启用会话；沿用忽略名单与消息合并设置。"
   },
   "relay_mode": {
     "type": "string",
@@ -24,11 +26,13 @@
       "base_url": {
         "type": "string",
         "default": "",
-        "description": "HTTPS Base URL"
+        "description": "HTTPS Base URL",
+        "hint": "可填写站点地址、带 /v1 的地址或完整 /v1/chat/completions 地址。"
       },
       "api_key": {
         "type": "string",
         "default": "",
+        "secret": true,
         "description": "API Key"
       },
       "model": {
@@ -824,7 +828,7 @@
   "disabled_sessions": {
     "type": "list",
     "default": [],
-    "description": "只排除自主接话的群号或 UMO",
+    "description": "排除 Jev 接管的群号、私聊用户号或 UMO",
     "hint": "这些群仍保留昵称、@、引用 Bot 唤醒和过滤。完全排除请从 enabled_sessions 移除。",
     "invisible": true
   },

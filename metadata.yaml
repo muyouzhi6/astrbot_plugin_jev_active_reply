@@ -1,6 +1,6 @@
 name: astrbot_plugin_jev_active_reply
 display_name: Jev主动回复插件
-desc: 自动读取人设和上下文，支持南北绿豆站与 TypeSafe 官方多 Key，自然接话、图文合并、自主沉默。
+desc: 自动读取人设和上下文，支持 Jev、AstrBot 提供商与自定义中转，可选点名和私聊接管、图文合并、自主沉默。
 version: 0.10.0
 author: 木有知
 repo: https://github.com/muyouzhi6/astrbot_plugin_jev_active_reply
