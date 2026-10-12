@@ -105,6 +105,7 @@ async def test_native_tool_status_does_not_abort_or_count_as_delivery(
         await env.plugin.before_output(ev)
         if not ev.is_stopped():
             await ev.send(ev.get_result())
+    await env.plugin.after_sent(ev)
     assert not ev.is_stopped()
     transport.assert_awaited_once()
     assert transport.await_args.args[0].get_plain_text() == "合成的检索回答"
@@ -237,6 +238,7 @@ async def test_takeover_bypasses_provider_wake_prefix_after_jev_admission(
     ev.set_result(ev.plain_result(response.completion_text))
     await env.plugin.before_output(ev)
     await ev.send(ev.get_result())
+    await env.plugin.after_sent(ev)
     transport.assert_awaited_once()
     assert env.plugin.metrics.replies == 1
     assert env.settings == original_settings
@@ -298,6 +300,7 @@ async def test_provider_prefix_respects_disabled_takeover_and_allows_explicit_wa
     await env.plugin.before_output(explicit)
     if not explicit.is_stopped():
         await explicit.send(explicit.get_result())
+    await env.plugin.after_sent(explicit)
     transport.assert_awaited_once()
     assert transport.await_args.args[0].get_plain_text() == "合成的回答"
     explicit.stop_event.assert_not_called()
@@ -397,6 +400,7 @@ async def test_provider_prefix_burst_keeps_one_native_reply(env, kind, phase):
         await env.plugin.before_output(event)
         if not event.is_stopped():
             await event.send(event.get_result())
+            await env.plugin.after_sent(event)
             sent.append(event)
             prompts.append(request.prompt)
 

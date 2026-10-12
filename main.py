@@ -587,8 +587,8 @@ class JevActiveReply(Star):
             # A decorator may replace the result or send its own chain after
             # our hooks. Clean the actual outgoing chain at the last send point.
             if self._must_reply(event):
-                # Retain one ambiguous send intact, including its media/order.
-                # A text continuation can resolve its trailing marker prefix.
+                # Retain one text send so trailing punctuation can join it.
+                # Ambiguous marker prefixes also retain their media/order.
                 root = {"message": None}
                 key = None
                 if native:
@@ -640,7 +640,6 @@ class JevActiveReply(Star):
                             container[key_] = text
                     await flush()
                 texts = [c[k] for c, k in fields]
-                follows_marker = meta.get("marker_tail")
                 if (
                     meta.get("marker_tail")
                     and texts
@@ -664,7 +663,7 @@ class JevActiveReply(Star):
                     and not meta.get("completing")
                     and fields
                     and (
-                        (text_only and follows_marker)
+                        text_only
                         or silence.incomplete_marker(fields[-1][0][fields[-1][1]])
                     )
                 ):
@@ -688,7 +687,7 @@ class JevActiveReply(Star):
                     if not silence.has_reply_content(chain.chain) and not any(
                         getattr(part, "text", "").strip()
                         and (
-                            final
+                            (final and silence.incomplete_marker(part.text))
                             or meta.get("sent_parts")
                             or silence.has_reply_content(
                                 getattr(event.get_result(), "chain", [])
@@ -1899,12 +1898,19 @@ class JevActiveReply(Star):
             return
         required = self._must_reply(event)
         if required:
-            silence.repair_required_reply(response=response)
+            silence.repair_required_reply(
+                response=response, fallback=not meta.get("sent_parts")
+            )
             text = str(response.completion_text or "").strip()
         if (is_refusal(text) or not text) and not (
             required
-            and response.result_chain is not None
-            and silence.has_reply_content(response.result_chain.chain)
+            and (
+                meta.get("sent_parts")
+                or (
+                    response.result_chain is not None
+                    and silence.has_reply_content(response.result_chain.chain)
+                )
+            )
         ):
             self._reject(event, response, "silent_or_cancelled")
             return
