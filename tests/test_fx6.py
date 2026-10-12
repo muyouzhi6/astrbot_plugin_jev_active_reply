@@ -89,8 +89,9 @@ async def test_inflight_media_completion_no_duplicate(env, kind, text):
                 **target,
             )
         )
-        await asyncio.wait_for(sending.wait(), 3)
+        await send_task
         release.set()
+        await asyncio.wait_for(sending.wait(), 3)
         await asyncio.sleep(0.05)
         delivered.set()
         await asyncio.gather(task, send_task)
@@ -117,19 +118,32 @@ async def test_native_send_receipt_contract(env, kind):
     target = {"user_id": 123456789} if kind == "private" else {"group_id": 987654321}
     receipt = await event.bot.send_msg(message="Synthetic answer", **target)
     await env.plugin._complete_output(event)
-    assert receipt == {"message_id": 42}, (receipt, payload(bot))
+    assert receipt is None
+    assert bot.transport.await_count == 1
+    assert any(
+        r == "send_completed" and d.get("receipt_id") == "42"
+        for _, r, d in env.plugin.audit_queue
+    )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("expired", [False, True])
 @pytest.mark.parametrize("fail", [False, True])
-async def test_completion_waits_for_transport(env, expired, fail):
+async def test_completion_waits_for_transport(env, monkeypatch, expired, fail):
     wake.configure(env)
     wake.judge_result(env, "reply")
     event, bot = adapter_event("at")
     await env.plugin.on_input(event)
     await env.plugin.on_message(event)
     entered, release = asyncio.Event(), asyncio.Event()
+    reasons = []
+    original_note = env.plugin._note
+
+    def note(ev, reason, details=None):
+        reasons.append(reason)
+        return original_note(ev, reason, details)
+
+    monkeypatch.setattr(env.plugin, "_note", note)
 
     async def transport(*args, **kwargs):
         entered.set()
@@ -147,24 +161,22 @@ async def test_completion_waits_for_transport(env, expired, fail):
     )
     finishing = None
     try:
-        await asyncio.wait_for(entered.wait(), 3)
+        await sending
         finishing = asyncio.create_task(
             env.plugin._complete_output(event, expired=expired)
         )
+        await asyncio.wait_for(entered.wait(), 3)
         await asyncio.sleep(0.02)
         assert not finishing.done()
         assert not event.get_extra(MARK).get("finished")
         release.set()
         results = await asyncio.gather(sending, finishing, return_exceptions=True)
-        assert (
-            isinstance(results[0], TimeoutError)
-            if fail
-            else results[0] == {"message_id": 42}
-        )
+        assert results[0] is None
         assert results[1] is None
         assert bot.transport.await_count == 1
         assert event.get_extra(MARK)["finished"]
         assert bool(event.get_extra(MARK).get("sent_parts")) == (not fail)
+        assert ("send_failed" in reasons) == fail
         assert not env.plugin.rooms.get(event.unified_msg_origin).pending
     finally:
         release.set()

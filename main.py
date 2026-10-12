@@ -15,7 +15,6 @@ from contextvars import ContextVar
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star
 from astrbot.core.agent.message import TextPart
 from astrbot.core.star.star_tools import StarTools
@@ -36,6 +35,7 @@ from .delivery import (
     EventBotProxy,
     SplitAdapters,
     install_completion_adapter,
+    plan_onebot,
 )
 from .policy import (
     Verdict,
@@ -631,7 +631,25 @@ class JevActiveReply(Star):
     def _install_sender(self, event):
         original_send = event.send
         nested = ContextVar("jev_delivery_owner", default=None)
-        pending = None
+        fragments = []
+        collectors = set()
+        idle = asyncio.Event()
+        idle.set()
+        sealed = False
+
+        def buffered_content():
+            for native, value in fragments:
+                if native:
+                    if silence.repair_native_reply(value, fallback=False) is not None:
+                        return True
+                else:
+                    cleaned = copy.deepcopy(value)
+                    silence.repair_required_reply(result=cleaned, fallback=False)
+                    if silence.has_reply_content(cleaned.chain):
+                        return True
+            return False
+
+        event.set_extra("_jev_buffered_content", buffered_content)
 
         async def context_failure_send(chain):
             token = nested.set(asyncio.current_task())
@@ -647,174 +665,81 @@ class JevActiveReply(Star):
             )
 
         async def flush():
-            nonlocal pending
-            if pending is not None:
-                (saved, _, _, root, key), pending = pending, None
-                operation, args, kwargs, native = saved
-                if native:
-                    if key:
-                        kwargs = {**kwargs, key: root["message"]}
-                    else:
-                        args = (args[0], root["message"], *args[2:])
-                saved = (operation, args, kwargs, native)
-                await send_operation(*saved, final=True)
-
-        event.set_extra("_jev_flush_output", flush)
-
-        async def send_operation(operation, args, kwargs, native=False, final=False):
-            nonlocal pending
-            task = asyncio.current_task()
-            if nested.get() is task:
-                if native:
-                    return await self._send_audited(event, operation, args, kwargs)
-                return await operation(*args, **kwargs)
-            # Core emits tool-call status chains while the agent is running.
-            # They are progress notifications, not the approved final reply.
-            chain = args[0] if args else None
-            if (
-                event.get_extra("_jev_takeover")
-                and getattr(chain, "type", None) == "tool_call"
-            ):
-                return None
+            nonlocal sealed
+            meta = event.get_extra(MARK)
+            if not meta.get("completing") or sealed:
+                return
+            current = asyncio.current_task()
+            while collectors - {current}:
+                await idle.wait()
+                idle.clear()
+            sealed = True
             if not await self._permit(event):
                 await self._context_failure_reply(event)
                 raise DeliveryDeclined("autonomous_delivery_cancelled")
-            meta = event.get_extra(MARK)
-            # A decorator may replace the result or send its own chain after
-            # our hooks. Clean the actual outgoing chain at the last send point.
-            if self._must_reply(event):
-                # Retain one text send so trailing punctuation can join it.
-                # Ambiguous marker prefixes also retain their media/order.
-                root = {"message": None}
-                key = None
-                if native:
-                    key = next(
-                        (k for k in ("message", "messages") if k in kwargs), None
+            if event.get_platform_name() == "aiocqhttp" and any(
+                native for native, _ in fragments
+            ):
+                plan = await plan_onebot(event, fragments)
+                if plan is None:
+                    plan = await plan_onebot(
+                        event, [(False, event.plain_result(silence.FALLBACK_REPLY))]
                     )
-                    root["message"] = copy.deepcopy(kwargs[key] if key else args[1])
-                    fields = list(silence._native_text_fields(root, "message"))
-                    value = root["message"]
-                    text_only = isinstance(value, str) or (
-                        isinstance(value, list)
-                        and all(
-                            isinstance(p, dict) and p.get("type") == "text"
-                            for p in value
-                        )
-                    )
-                else:
-                    args = (chain, *args[1:])
-                    fields = [
+                action, params = plan
+                if not await self._permit(event):
+                    await self._context_failure_reply(event)
+                    raise DeliveryDeclined("autonomous_delivery_cancelled")
+                await transmit(event.bot.call_action, (action,), params)
+            else:
+                chain = event.chain_result(
+                    [
+                        p
+                        for native, value in fragments
+                        if not native
+                        for p in value.chain
+                    ]
+                )
+                silence.clean_delivery_fields(
+                    [
                         (p.__dict__, "text")
                         for p in silence._plain_components(chain.chain)
                     ]
-                    text_only = all(isinstance(p, Plain) for p in chain.chain)
-                if pending is not None and not final:
-                    _, target, field, _, _ = pending
-                    continuation = "".join(c[k] for c, k in fields)
-                    ambiguous = silence.incomplete_marker(target[field])
-                    if (
-                        fields
-                        and text_only
-                        and (ambiguous or not silence._meaningful(continuation))
+                )
+                silence.repair_required_reply(result=chain, fallback=False)
+                if not silence.has_reply_content(
+                    chain.chain
+                ) and not chain.get_plain_text().strip("。.!！?？… \t\r\n"):
+                    chain = event.plain_result(silence.FALLBACK_REPLY)
+                if event.get_platform_name() == "aiocqhttp":
+                    from astrbot.api.message_components import File, Node, Nodes, Record
+
+                    if len(chain.chain) > 1 and any(
+                        isinstance(p, (Record, File)) for p in chain.chain
                     ):
-                        target[field] += continuation
-                        return None
-                    if fields and ambiguous:
-                        # Remove spans across sends without moving or consuming
-                        # any media or nested forwarding components.
-                        combined = [(target, field), *fields]
-                        joined = "".join(c[k] for c, k in combined)
-                        if silence.incomplete_marker(joined):
-                            fields[0][0][fields[0][1]] = (
-                                target[field] + fields[0][0][fields[0][1]]
+                        chain.chain = [
+                            Nodes(
+                                [
+                                    Node(
+                                        uin=str(event.get_self_id()),
+                                        name="AstrBot",
+                                        content=[p],
+                                    )
+                                    for p in chain.chain
+                                ]
                             )
-                            target[field] = ""
-                        for (container, key_), text in zip(
-                            combined,
-                            silence._clean_texts([c[k] for c, k in combined]),
-                        ):
-                            container[key_] = text
-                    await flush()
-                texts = [c[k] for c, k in fields]
-                if (
-                    meta.get("marker_tail")
-                    and texts
-                    and not silence._meaningful("".join(texts))
-                ):
-                    for c, k in fields:
-                        c[k] = ""
-                elif texts:
-                    text = "".join(texts)
-                    meta["marker_tail"] = bool(
-                        silence.MARKER.search(text)
-                        and not silence._meaningful(silence.MARKER.sub("", text))
-                    )
-                if native:
-                    if key:
-                        kwargs = {**kwargs, key: root["message"]}
-                    else:
-                        args = (args[0], root["message"], *args[2:])
-                if (
-                    not final
-                    and not meta.get("completing")
-                    and fields
-                    and (
-                        (text_only and not native)
-                        or silence.incomplete_marker(fields[-1][0][fields[-1][1]])
-                    )
-                ):
-                    if not native:
-                        chain = copy.deepcopy(chain)
-                        args = (chain, *args[1:])
-                        fields = [
-                            (p.__dict__, "text")
-                            for p in silence._plain_components(chain.chain)
                         ]
-                    pending = (
-                        (operation, args, kwargs, native),
-                        *fields[-1],
-                        root,
-                        key,
-                    )
-                    return None
-                if not native and hasattr(chain, "chain"):
-                    silence.repair_required_reply(result=chain, fallback=False)
-                    # Core can send Record first, then a marker-only remainder.
-                    if not silence.has_reply_content(chain.chain) and not any(
-                        getattr(part, "text", "").strip()
-                        and (
-                            (final and silence.incomplete_marker(part.text))
-                            or part.text.strip("。.!！?？… \t\r\n")
-                        )
-                        for part in chain.chain
-                    ):
-                        return None
-                    if event.get_platform_name() == "aiocqhttp":
-                        silence.combine_forward_reply(chain, event.get_self_id())
-                if native:
-                    for key in ("message", "messages"):
-                        if key in kwargs:
-                            kwargs[key] = silence.repair_native_reply(
-                                kwargs[key],
-                                forward=key == "messages",
-                                fallback=False,
-                            )
-                            if kwargs[key] is None:
-                                return None
-                    # CQHttp.send(event, message) also accepts positional content.
-                    # call_action has only the action name before keyword params.
-                    if len(args) > 1:
-                        message = silence.repair_native_reply(args[1], fallback=False)
-                        if message is None:
-                            return None
-                        args = (
-                            args[0],
-                            message,
-                            *args[2:],
-                        )
+                    silence.combine_forward_reply(chain, event.get_self_id())
+                if chain.chain:
+                    await transmit(original_send, (chain,), {})
+
+        event.set_extra("_jev_flush_output", flush)
+
+        async def transmit(operation, args, kwargs, native=False):
+            task = asyncio.current_task()
+            meta = event.get_extra(MARK)
             token = nested.set(task)
-            idle = meta.setdefault("send_idle", asyncio.Event())
-            idle.clear()
+            send_idle = meta.setdefault("send_idle", asyncio.Event())
+            send_idle.clear()
             meta["send_depth"] = meta.get("send_depth", 0) + 1
             frame = event.get_extra(burst.FRAME)
             if frame:
@@ -834,11 +759,57 @@ class JevActiveReply(Star):
             finally:
                 meta["send_depth"] -= 1
                 if not meta["send_depth"]:
-                    idle.set()
+                    send_idle.set()
                 if frame:
                     frame.sending -= 1
                 nested.reset(token)
                 self.tasks.discard(task)
+
+        async def send_operation(operation, args, kwargs, native=False):
+            task = asyncio.current_task()
+            if nested.get() is task:
+                if native:
+                    return await self._send_audited(event, operation, args, kwargs)
+                return await operation(*args, **kwargs)
+            chain = args[0] if args else None
+            if (
+                event.get_extra("_jev_takeover")
+                and getattr(chain, "type", None) == "tool_call"
+            ):
+                return None
+            meta = event.get_extra(MARK)
+            if self._must_reply(event):
+                if sealed or meta.get("finished"):
+                    raise DeliveryDeclined("output_already_completed")
+                if native:
+                    value = next(
+                        (kwargs[k] for k in ("message", "messages") if k in kwargs),
+                        None,
+                    )
+                    if value is None and len(args) > 1:
+                        value = args[1]
+                else:
+                    value = chain
+                # Reserve order before the first await; never replace another slot.
+                slot = (native, copy.deepcopy(value))
+                fragments.append(slot)
+                collectors.add(task)
+                idle.clear()
+                try:
+                    if not await self._permit(event):
+                        await self._context_failure_reply(event)
+                        raise DeliveryDeclined("autonomous_delivery_cancelled")
+                except BaseException:
+                    fragments[:] = [item for item in fragments if item is not slot]
+                    raise
+                finally:
+                    collectors.discard(task)
+                    idle.set()
+                return None
+            if not await self._permit(event):
+                await self._context_failure_reply(event)
+                raise DeliveryDeclined("autonomous_delivery_cancelled")
+            return await transmit(operation, args, kwargs, native)
 
         async def send(chain, *args, **kwargs):
             return await send_operation(original_send, (chain, *args), kwargs)
@@ -2073,7 +2044,10 @@ class JevActiveReply(Star):
                 flush = event.get_extra("_jev_flush_output")
                 if flush:
                     await flush()
-                if meta.get("sent_parts"):
+                if (
+                    meta.get("sent_parts")
+                    or event.get_extra("_jev_buffered_content", lambda: False)()
+                ):
                     await self._complete_output(event)
                     silence.clear_output(event, response)
                     return
@@ -2087,7 +2061,11 @@ class JevActiveReply(Star):
                 silence.clear_output(event, response)
                 return
             silence.repair_required_reply(
-                response=response, fallback=not meta.get("sent_parts")
+                response=response,
+                fallback=not (
+                    meta.get("sent_parts")
+                    or event.get_extra("_jev_buffered_content", lambda: False)()
+                ),
             )
             event.set_extra("_llm_reasoning_content", response.reasoning_content)
             text = str(response.completion_text or "").strip()
@@ -2095,6 +2073,7 @@ class JevActiveReply(Star):
             required
             and (
                 meta.get("sent_parts")
+                or event.get_extra("_jev_buffered_content", lambda: False)()
                 or (
                     response.result_chain is not None
                     and silence.has_reply_content(response.result_chain.chain)
@@ -2286,7 +2265,11 @@ class JevActiveReply(Star):
         if self._must_reply(event):
             await self._wait_delivery(meta)
             silence.repair_required_reply(
-                result=result, fallback=not meta.get("sent_parts")
+                result=result,
+                fallback=not (
+                    meta.get("sent_parts")
+                    or event.get_extra("_jev_buffered_content", lambda: False)()
+                ),
             )
         text = result.get_plain_text().strip() if result else ""
         if is_refusal(text):
@@ -2320,7 +2303,10 @@ class JevActiveReply(Star):
             and not self._blocked(event)
             and self._must_reply(event)
         ):
-            silence.repair_required_reply(result=result)
+            silence.repair_required_reply(
+                result=result,
+                fallback=not event.get_extra("_jev_buffered_content", lambda: False)(),
+            )
         if (
             result is not None
             and self._must_reply(event)

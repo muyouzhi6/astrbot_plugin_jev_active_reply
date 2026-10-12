@@ -46,7 +46,7 @@ async def test_successful_media_then_model_output(env, kind, text):
             await event.bot.send_group_msg(group_id=987654321, message=message)
         release.set()
         await task
-        assert bot.transport.await_count == (2 if text == "Normal answer" else 1)
+        assert bot.transport.await_count == 1
         assert "image" in payload(bot)
         assert silence.FALLBACK_REPLY not in payload(bot)
         assert "[PASS]" not in payload(bot) and "[不回复]" not in payload(bot)
@@ -83,9 +83,7 @@ async def test_plain_tail_preserved_with_body(env, kind, native, body, tail):
     await pipeline(
         env, event, adapter=True, native_send=emit, decoration_priority=-200000
     )
-    expected = ["First answer", body + tail]
-    if native:
-        expected = ["First answer", body] + ([tail] if tail != "。" else [])
+    expected = ["First answer" + body + tail]
     assert texts(bot) == expected
     assert event.get_extra(MARK)["finished"]
 
@@ -112,4 +110,4 @@ async def test_core_segmented_tail(env, monkeypatch, kind):
         adapter=True,
         parts=[Plain("First answer"), Plain("Second answer"), Plain("。")],
     )
-    assert texts(bot) == ["First answer", "Second answer。"]
+    assert texts(bot) == ["First answerSecond answer。"]

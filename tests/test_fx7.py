@@ -89,8 +89,8 @@ async def test_native_punctuation_not_standalone(env, kind, payload):
             receipts.append(await ev.bot.send_msg(message=message, **target))
 
     await pipeline(env, event, adapter=True, native_send=emit)
-    assert texts(bot) == ["Synthetic answer"]
-    assert receipts == [{"message_id": 42}, None]
+    assert texts(bot) == ["Synthetic answer。"]
+    assert receipts == [None, None]
 
 
 @pytest.mark.asyncio

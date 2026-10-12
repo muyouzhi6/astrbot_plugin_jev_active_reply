@@ -76,6 +76,18 @@ def _component_lists(parts):
             yield from _component_lists(part.nodes)
 
 
+def clean_delivery_fields(fields):
+    """Remove marker continuations and their punctuation across send fragments."""
+    values = [container[key] for container, key in fields]
+    marker_tail = False
+    for (container, key), old, cleaned in zip(fields, values, _clean_texts(values)):
+        if old != cleaned and not _meaningful(cleaned):
+            marker_tail = True
+        elif _meaningful(cleaned):
+            marker_tail = False
+        container[key] = "" if marker_tail and not _meaningful(cleaned) else cleaned
+
+
 def _plain_components(parts):
     for part in parts:
         if isinstance(part, Plain):

@@ -337,7 +337,9 @@ async def test_forward_nodes_clean_recursively_without_extra_send(
     send.assert_awaited_once()
     assert len(send.await_args.args[0].chain) == 1
     if body or stage != "final_send":
-        assert send.await_args.args[0].chain[0] is node
+        expected = deepcopy(node)
+        silence.repair_required_reply(result=event.chain_result([expected]))
+        assert send.await_args.args[0].chain[0] == expected
     else:
         assert send.await_args.args[0].get_plain_text() == silence.FALLBACK_REPLY
 
@@ -376,7 +378,10 @@ async def test_media_reply_does_not_gain_fallback(
     )
     payload = platform_payload(bot)
     assert silence.FALLBACK_REPLY not in payload
-    assert (node.content if node else send.await_args.args[0].chain) == [media]
+    delivered = send.await_args.args[0].chain
+    if node:
+        delivered = delivered[0].nodes[0].content
+    assert delivered == [media]
 
 
 @pytest.mark.asyncio
@@ -606,7 +611,10 @@ async def test_cleanup_keeps_each_plain_and_image_in_order(env, stage):
     await assert_one_reply(env, event, send)
     chain = send.await_args.args[0].chain
     assert len(chain) == len(expected)
-    assert all(actual is original for actual, original in zip(chain, expected))
+    assert [type(p) for p in chain] == [type(p) for p in expected]
+    assert [p for p in chain if isinstance(p, Image)] == [
+        p for p in expected if isinstance(p, Image)
+    ]
     assert [part.text for part in chain if isinstance(part, Plain)] == [
         "图前说明",
         "图后解释",

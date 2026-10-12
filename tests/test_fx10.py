@@ -82,11 +82,11 @@ async def test_each_platform_send_has_persistable_evidence(env):
             )
 
     await pipeline(env, event, "[PASS]", adapter=True, native_send=emit)
-    assert bot.transport.await_count == 2
+    assert bot.transport.await_count == 1
     rows = list(env.plugin.audit_queue)
     for reason in ("send_attempt", "send_completed"):
         details = [d for _, r, d in rows if r == reason]
-        assert [d["send_sequence"] for d in details] == [1, 2]
+        assert [d["send_sequence"] for d in details] == [1]
         assert all(
             d["ingress_id"] == scope_id(str(event.message_obj.message_id))
             for d in details
@@ -95,13 +95,13 @@ async def test_each_platform_send_has_persistable_evidence(env):
             d["sender_hash"] == scope_id(str(event.get_sender_id())) for d in details
         )
         if reason == "send_completed":
-            assert [d["receipt_id"] for d in details] == ["42", "42"]
+            assert [d["receipt_id"] for d in details] == ["42"]
         for detail in details:
             env.plugin.ledger.record(event.unified_msg_origin, reason, detail)
         stored = env.plugin.ledger.db.execute(
             "SELECT details FROM audit WHERE reason=? ORDER BY id", (reason,)
         ).fetchall()
-        assert [json.loads(row[0])["send_sequence"] for row in stored] == [1, 2]
+        assert [json.loads(row[0])["send_sequence"] for row in stored] == [1]
     assert env.plugin.metrics.replies == 1
 
 

@@ -4,6 +4,77 @@ import copy
 from functools import wraps
 from types import SimpleNamespace
 
+from astrbot.api.message_components import Node, Nodes
+
+from . import silence
+
+
+async def plan_onebot(event, fragments):
+    """Serialize once, retaining opaque native segments and their order."""
+    from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+        AiocqhttpMessageEvent,
+    )
+
+    parts = []
+    for native, value in fragments:
+        if native:
+            if isinstance(value, str):
+                value = [{"type": "text", "data": {"text": value}}]
+            if isinstance(value, dict):
+                value = value.get("messages", [value])
+            parts.extend(value)
+        else:
+            for component in value.chain:
+                if isinstance(component, Nodes):
+                    parts.extend((await component.to_dict())["messages"])
+                elif isinstance(component, Node):
+                    parts.append(await component.to_dict())
+                else:
+                    parts.extend(
+                        await AiocqhttpMessageEvent._parse_onebot_json(
+                            event.chain_result([component])
+                        )
+                    )
+    root = {"message": parts}
+    fields = list(silence._native_text_fields(root, "message"))
+    silence.clean_delivery_fields(fields)
+    parts = silence.repair_native_reply(parts, fallback=False)
+    if parts is None:
+        return None
+    # Records cannot be mixed with text or other records in a normal QQ message.
+    forward = any(p.get("type") == "node" for p in parts) or (
+        len(parts) > 1 and any(p.get("type") in {"record", "file"} for p in parts)
+    )
+    if forward:
+        parts = [
+            p
+            if p.get("type") == "node"
+            else {
+                "type": "node",
+                "data": {
+                    "user_id": str(event.get_self_id()),
+                    "nickname": "AstrBot",
+                    "content": [p],
+                },
+            }
+            for p in parts
+        ]
+    group = bool(event.get_group_id())
+    target = {
+        "group_id" if group else "user_id": int(
+            event.get_group_id() if group else event.get_sender_id()
+        )
+    }
+    raw = getattr(event.message_obj, "raw_message", None)
+    if isinstance(raw, dict) and raw.get("self_id"):
+        target["self_id"] = raw["self_id"]
+    action = (
+        ("send_group_forward_msg" if group else "send_private_forward_msg")
+        if forward
+        else "send_msg"
+    )
+    return action, {**target, "messages" if forward else "message": parts}
+
 
 def install_completion_adapter():
     """Core has no completion hook for empty/stopped results; scope by event."""

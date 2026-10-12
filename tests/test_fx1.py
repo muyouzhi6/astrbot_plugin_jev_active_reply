@@ -63,7 +63,7 @@ async def test_silent_fragments_wait_for_complete_output(
     else:
         assert "Answer" in encoded
         assert silence.FALLBACK_REPLY not in json.loads(json.dumps(encoded))
-        assert bot.transport.await_count == (2 if order == "middle" else 1)
+        assert bot.transport.await_count == 1
         if order == "middle":
             assert "Conclusion" in encoded
 
@@ -166,10 +166,12 @@ async def test_core_tts_preserves_all_segments(env, monkeypatch, tmp_path, dual)
         "Second answer。",
     ]
     calls = bot.transport.await_args_list
-    assert len(calls) == (3 if dual else 2)
-    assert all(c.kwargs["message"][0]["type"] == "record" for c in calls[:2])
+    assert len(calls) == 1
+    parts = [p for node in calls[0].kwargs["messages"] for p in node["data"]["content"]]
+    assert [p["type"] for p in parts[:2]] == ["record", "record"]
+    assert all(p["data"]["file"].startswith("base64://") for p in parts[:2])
     if dual:
-        assert [p["data"]["text"] for p in calls[2].kwargs["message"]] == [
+        assert [p["data"]["text"] for p in parts[2:]] == [
             "First answer",
             "Second answer。",
         ]
