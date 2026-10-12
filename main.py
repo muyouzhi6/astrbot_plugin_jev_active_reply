@@ -546,12 +546,29 @@ class JevActiveReply(Star):
     def _install_sender(self, event):
         original_send = event.send
         nested = ContextVar("jev_delivery_owner", default=None)
+        pending = None
         if self._must_reply(event):
             event.set_extra(
                 "_jev_complete_output", lambda: self._complete_output(event)
             )
 
-        async def send_operation(operation, args, kwargs, native=False):
+        async def flush():
+            nonlocal pending
+            if pending is not None:
+                (saved, _, _, root, key), pending = pending, None
+                operation, args, kwargs, native = saved
+                if native:
+                    if key:
+                        kwargs = {**kwargs, key: root["message"]}
+                    else:
+                        args = (args[0], root["message"], *args[2:])
+                saved = (operation, args, kwargs, native)
+                await send_operation(*saved, final=True)
+
+        event.set_extra("_jev_flush_output", flush)
+
+        async def send_operation(operation, args, kwargs, native=False, final=False):
+            nonlocal pending
             task = asyncio.current_task()
             if nested.get() is task:
                 return await operation(*args, **kwargs)
@@ -569,14 +586,79 @@ class JevActiveReply(Star):
             # A decorator may replace the result or send its own chain after
             # our hooks. Clean the actual outgoing chain at the last send point.
             if self._must_reply(event):
+                # Retain one ambiguous send intact, including its media/order.
+                # A text continuation can resolve its trailing marker prefix.
+                root = {"message": None}
+                key = None
+                if native:
+                    key = next(
+                        (k for k in ("message", "messages") if k in kwargs), None
+                    )
+                    root["message"] = copy.deepcopy(kwargs[key] if key else args[1])
+                    fields = list(silence._native_text_fields(root, "message"))
+                    value = root["message"]
+                    text_only = isinstance(value, str) or (
+                        isinstance(value, list)
+                        and all(
+                            isinstance(p, dict) and p.get("type") == "text"
+                            for p in value
+                        )
+                    )
+                else:
+                    args = (chain, *args[1:])
+                    fields = [
+                        (p.__dict__, "text")
+                        for p in silence._plain_components(chain.chain)
+                    ]
+                    text_only = len(fields) == len(chain.chain)
+                if pending is not None and not final:
+                    if fields and text_only:
+                        _, target, field, _, _ = pending
+                        target[field] += "".join(c[k] for c, k in fields)
+                        if silence.incomplete_marker(target[field]):
+                            return None
+                        await flush()
+                        return None
+                    await flush()
+                texts = [c[k] for c, k in fields]
+                if (
+                    meta.get("marker_tail")
+                    and texts
+                    and not silence._meaningful("".join(texts))
+                ):
+                    for c, k in fields:
+                        c[k] = ""
+                elif texts:
+                    text = "".join(texts)
+                    meta["marker_tail"] = bool(
+                        silence.MARKER.search(text)
+                        and not silence._meaningful(silence.MARKER.sub("", text))
+                    )
+                if native:
+                    if key:
+                        kwargs = {**kwargs, key: root["message"]}
+                    else:
+                        args = (args[0], root["message"], *args[2:])
+                if (
+                    not final
+                    and fields
+                    and silence.incomplete_marker(fields[-1][0][fields[-1][1]])
+                ):
+                    pending = (
+                        (operation, args, kwargs, native),
+                        *fields[-1],
+                        root,
+                        key,
+                    )
+                    return None
                 if not native and hasattr(chain, "chain"):
-                    self._buffer_marker(event, chain)
                     silence.repair_required_reply(result=chain, fallback=False)
                     # Core can send Record first, then a marker-only remainder.
                     if not silence.has_reply_content(chain.chain) and not any(
                         getattr(part, "text", "").strip()
                         and (
-                            meta.get("sent_parts")
+                            final
+                            or meta.get("sent_parts")
                             or silence.has_reply_content(
                                 getattr(event.get_result(), "chain", [])
                             )
@@ -589,7 +671,6 @@ class JevActiveReply(Star):
                 if native:
                     for key in ("message", "messages"):
                         if key in kwargs:
-                            kwargs[key] = self._buffer_native(event, kwargs[key])
                             kwargs[key] = silence.repair_native_reply(
                                 kwargs[key],
                                 forward=key == "messages",
@@ -600,7 +681,6 @@ class JevActiveReply(Star):
                     # CQHttp.send(event, message) also accepts positional content.
                     # call_action has only the action name before keyword params.
                     if len(args) > 1:
-                        args = (args[0], self._buffer_native(event, args[1]), *args[2:])
                         message = silence.repair_native_reply(args[1], fallback=False)
                         if message is None:
                             return None
@@ -1508,44 +1588,18 @@ class JevActiveReply(Star):
                 self._reject(event, None, "request_lease_expired")
 
     @staticmethod
-    def _buffer_marker(event, chain):
-        meta = event.get_extra(MARK)
-        plains = list(silence._plain_components(chain.chain))
-        if not plains:
-            return
-        plains[0].text = meta.pop("marker_prefix", "") + plains[0].text
-        text = plains[-1].text
-        for size in range(min(len(text), 7), 0, -1):
-            suffix = text[-size:]
-            if any(
-                marker.startswith(suffix) and marker != suffix
-                for marker in ("[PASS]", "[pass]", "[不回复]")
-            ):
-                meta["marker_prefix"] = suffix
-                plains[-1].text = text[:-size]
-                break
-
-    def _buffer_native(self, event, value):
-        root = {"message": copy.deepcopy(value)}
-        fields = list(silence._native_text_fields(root, "message"))
-        if fields:
-            chain = event.chain_result([])
-            for container, key in fields:
-                chain.chain.extend(event.plain_result(container[key]).chain)
-            self._buffer_marker(event, chain)
-            for (container, key), part in zip(fields, chain.chain):
-                container[key] = part.text
-        return root["message"]
-
-    @staticmethod
     def _resume_required(event):
-        if event.is_stopped() and not any(
-            event.get_extra(key)
-            for key in (
-                silence.RECALL,
-                silence.SILENT,
-                "agent_stop_requested",
-                "_suanle_silent_requested",
+        if (
+            event.is_stopped()
+            and not event.get_extra(MARK, {}).get("sent_parts")
+            and not any(
+                event.get_extra(key)
+                for key in (
+                    silence.RECALL,
+                    silence.SILENT,
+                    "agent_stop_requested",
+                    "_suanle_silent_requested",
+                )
             )
         ):
             event.continue_event()
@@ -1562,10 +1616,9 @@ class JevActiveReply(Star):
                 self._resume_required(event)
                 if expired:
                     meta["created"] = time.monotonic()
-                prefix = meta.pop("marker_prefix", "")
-                if prefix and not self._blocked(event):
-                    # An unfinished control prefix is withheld, never leaked.
-                    self._note(event, "incomplete_control_marker")
+                flush = event.get_extra("_jev_flush_output")
+                if flush and not self._blocked(event):
+                    await flush()
                 if not meta.get("sent_parts") and not self._blocked(event):
                     meta["reviewed"] = meta["output_ready"] = True
                     await event.send(event.plain_result(silence.FALLBACK_REPLY))

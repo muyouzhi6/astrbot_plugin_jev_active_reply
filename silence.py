@@ -27,6 +27,14 @@ MARKER = re.compile(r"\[(?:PASS|pass|不回复)\]")
 FALLBACK_REPLY = "我在，请再说一下你的问题。"
 
 
+def incomplete_marker(text):
+    return any(
+        text.endswith(marker[:size])
+        for marker in ("[PASS]", "[pass]", "[不回复]")
+        for size in range(1, len(marker))
+    )
+
+
 def _meaningful(text):
     return any(
         not char.isspace() and not unicodedata.category(char).startswith(("P", "C"))
