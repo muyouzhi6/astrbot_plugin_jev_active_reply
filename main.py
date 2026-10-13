@@ -359,6 +359,9 @@ class JevActiveReply(Star):
             "superseded",
             "conversation_changed",
             "candidate_wait_expired",
+            "history_refresh_admitted",
+            "history_refresh_silence",
+            "history_refresh_unstable",
         }:
             self.metrics.outcomes[reason] += 1
         if self.audit_task is None or self.audit_task.done():
@@ -1716,20 +1719,7 @@ class JevActiveReply(Star):
                     response = await self._judge(
                         event, state, questions_for(self.config)
                     )
-                    if self._cfg("decision_mode", "classic") == "natural":
-                        verdict = natural_decide(
-                            response["values"],
-                            self._cfg("style", "balanced"),
-                            self.config,
-                        )
-                    else:
-                        verdict = decide(
-                            response["values"],
-                            active,
-                            recent,
-                            self._cfg("style", "balanced"),
-                            self.config,
-                        )
+                    verdict = self._social_verdict(response["values"], active, recent)
                 except Exception as exc:
                     if isinstance(exc, DecisionError):
                         self._note(event, exc.code, {"status": exc.status})
@@ -1741,15 +1731,6 @@ class JevActiveReply(Star):
                         return
                     response = {"values": {}}
                     verdict = Verdict(True, "respond", "explicit_reply_required")
-                values = response["values"]
-                if (
-                    not verdict.speak
-                    and verdict.reason == "uncertain_or_low_value"
-                    and self._cfg("uncertain_adjudication", True)
-                    and values["worthwhile"] >= 0.55
-                    and values["intrusive"] <= 0.25
-                ):
-                    verdict = Verdict(True, "adjudicate", "native_context_adjudication")
             if required:
                 verdict = Verdict(True, "respond", "explicit_reply_required")
             details = {
@@ -1781,11 +1762,25 @@ class JevActiveReply(Star):
                 self._note(event, "superseded")
                 return
             fresh_cid, conv = await self._read_conversation(event)
-            if fresh_cid != cid or (
-                not required and bridge.fingerprint(conv) != history_hash
-            ):
+            if fresh_cid != cid:
                 event.set_extra("_jev_admission_cancelled", True)
                 self._note(event, "conversation_changed")
+                return
+            if not required and bridge.fingerprint(conv) != history_hash:
+                refreshed = await self._refresh_admission(
+                    event, room, target, generation, cid, now, verdict
+                )
+                if refreshed is None:
+                    return
+                state, verdict = refreshed
+            if not required and (
+                self._blocked(event)
+                or self._quiet(event, room)
+                or generation != room.generation
+                or bridge.native_busy(event)
+                or time.monotonic() - now > 20
+            ):
+                self._note(event, "superseded")
                 return
             settings = self.context.get_config(umo=umo)
             provider_settings = settings.get("provider_settings", {})
@@ -1883,6 +1878,97 @@ class JevActiveReply(Star):
         if room:
             room.release(meta["ticket"])
         self._note(event, reason)
+
+    def _social_verdict(self, values, active, recent):
+        if self._cfg("decision_mode", "classic") == "natural":
+            return natural_decide(values, self._cfg("style", "balanced"), self.config)
+        verdict = decide(
+            values, active, recent, self._cfg("style", "balanced"), self.config
+        )
+        if (
+            not verdict.speak
+            and verdict.reason == "uncertain_or_low_value"
+            and self._cfg("uncertain_adjudication", True)
+            and values["worthwhile"] >= 0.55
+            and values["intrusive"] <= 0.25
+        ):
+            return Verdict(True, "adjudicate", "native_context_adjudication")
+        return verdict
+
+    async def _refresh_admission(
+        self, event, room, target, generation, cid, started, verdict
+    ):
+        """Rejudge once when a native reply finishes during admission."""
+
+        def stale():
+            return (
+                self.closed
+                or self._blocked(event)
+                or self._quiet(event, room)
+                or generation != room.generation
+                or bridge.native_busy(event)
+                or time.monotonic() - started > 20
+            )
+
+        if stale():
+            self._note(event, "history_refresh_cancelled")
+            return None
+        self._note(event, "history_refresh_started")
+        state, refreshed_cid, history_hash = await asyncio.wait_for(
+            bridge.build_snapshot(self.context, event, room, target, self.config), 3
+        )
+        if refreshed_cid != cid:
+            event.set_extra("_jev_admission_cancelled", True)
+            self._note(event, "conversation_changed")
+            return None
+        state["ignored_background"] = self.ignored_background.text(
+            event.unified_msg_origin, self._silence_settings()
+        )
+        fresh_cid, conv = await self._read_conversation(event)
+        if fresh_cid != cid or bridge.fingerprint(conv) != history_hash:
+            self._note(event, "history_refresh_unstable")
+            return None
+        state["activity"]["latest_completed_reply"] = bridge.latest_reply(conv)
+        state["activity"]["history_refreshed"] = True
+        state["activity"]["refresh_reason"] = (
+            "An earlier native reply completed while judging this target. "
+            "Use latest_completed_reply alongside the conversation: stay silent if "
+            "it already handles the target; otherwise consider the still-open follow-up."
+        )
+        state = fit_state(state, questions_for(self.config), self.config)
+        if stale():
+            self._note(event, "history_refresh_cancelled")
+            return None
+        # Native-vision mode delegates content judgment to the main model.
+        if verdict.mode != "perceive":
+            try:
+                response = await self._judge(event, state, questions_for(self.config))
+            except DecisionError as exc:
+                self._note(event, exc.code, {"status": exc.status})
+                return None
+            now = time.monotonic()
+            active = bool(
+                room.last_sent
+                and now - room.last_sent
+                <= float(self._cfg("continuation_seconds", 180))
+            )
+            recent = sum(now - stamp < 120 for stamp in room.sent_times)
+            verdict = self._social_verdict(response["values"], active, recent)
+            if not verdict.speak:
+                room.last_judged_text = str(target.get("content", ""))[:4096]
+                room.last_judged_at = now
+                self._note(event, "history_refresh_silence", response)
+                return None
+        fresh_cid, conv = await self._read_conversation(event)
+        if fresh_cid != cid:
+            event.set_extra("_jev_admission_cancelled", True)
+            self._note(event, "conversation_changed")
+            return None
+        if stale() or bridge.fingerprint(conv) != history_hash:
+            self._note(event, "history_refresh_unstable")
+            return None
+        self._note(event, "history_refresh_admitted")
+        return state, verdict
 
     def _boundary_decision(self, values, recent=0):
         if self._cfg("decision_mode", "classic") == "natural":
@@ -2749,7 +2835,7 @@ class JevActiveReply(Star):
             await asyncio.shield(self.audit_task)
         pools = [pool.status() for pool in self.client.pools.values()]
         lines = [
-            "Jev 主动回复插件 0.10.4 · 木有知",
+            "Jev 主动回复插件 0.10.5 · 木有知",
             f"当前会话：{'已启用' if self._enabled(event) else '未启用'}",
         ]
         names = {

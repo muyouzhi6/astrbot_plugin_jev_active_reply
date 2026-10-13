@@ -90,6 +90,32 @@ def fingerprint(conversation):
     ).hexdigest()
 
 
+def latest_reply(conversation):
+    """Expose the newest completed reply even before public history catches up."""
+    history = getattr(conversation, "history", [])
+    try:
+        history = json.loads(history) if isinstance(history, str) else history
+    except (ValueError, TypeError):
+        return ""
+    if not isinstance(history, list) or not history:
+        return ""
+    last = history[-1]
+    if (
+        not isinstance(last, dict)
+        or last.get("role") != "assistant"
+        or last.get("tool_calls")
+    ):
+        return ""
+    content = last.get("content", "")
+    if isinstance(content, list):
+        return "\n".join(
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict) and part.get("type") in ("text", "output_text")
+        )
+    return content if isinstance(content, str) else ""
+
+
 async def conversation(context, event):
     manager = context.conversation_manager
     cid = await manager.get_curr_conversation_id(event.unified_msg_origin)
