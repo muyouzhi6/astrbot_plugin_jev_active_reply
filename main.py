@@ -1162,9 +1162,10 @@ class JevActiveReply(Star):
         if action in ("pass", "skip") and event.is_at_or_wake_command:
             action, reason = "direct", "native_explicit_wake"
         if room is None:
-            # Do not revoke native handling until a room can be reserved.
+            # Preserve wake classification for admission's bounded fallback.
             if action == "direct":
                 event.is_at_or_wake_command = True
+                event.set_extra("_jev_direct_wake", reason)
             elif action == "quiet":
                 event.stop_event()
             return
@@ -1260,9 +1261,6 @@ class JevActiveReply(Star):
             return  # No request ownership was accepted; retain the native wake.
         self._must_reply(event)
         if owned:
-            if self.rooms.get(event.unified_msg_origin) is None:
-                self._note(event, "room_capacity_native_wake")
-                return
             event.set_extra("_jev_takeover", True)
             event.set_extra("_jev_turn_id", uuid.uuid4().hex)
             event.set_extra("_jev_context_failure_sender", event.send)
@@ -1332,6 +1330,7 @@ class JevActiveReply(Star):
             return
         room = self.rooms.get(event.unified_msg_origin)
         if room is None:
+            self._note(event, "room_capacity_exhausted")
             return
         if not self._cfg("dry_run", False):
             await self._load_quiet(event, room)

@@ -79,7 +79,7 @@ async def test_deadline_before_timer_completes(env, entry):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["at", "name", "private"])
-async def test_full_capacity_preserves_native_wake(env, kind):
+async def test_full_capacity_closes_wake_without_allocating_room(env, kind):
     wake.configure(env)
     wake.judge_result(env, "reply")
     for n in range(env.plugin.rooms.capacity):
