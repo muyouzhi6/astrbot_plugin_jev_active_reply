@@ -72,7 +72,7 @@ async def test_deadline_before_timer_completes(env, entry):
         await env.plugin.on_input(other)
         await env.plugin.on_message(other)
     await env.plugin._complete_output(event, expired=True)
-    assert bot.transport.await_count == 1, payload(bot)
+    assert bot.transport.await_count == 0, payload(bot)
     assert meta["finished"]
     assert not meta.get("lease")
 
@@ -86,6 +86,6 @@ async def test_full_capacity_closes_wake_without_allocating_room(env, kind):
         env.plugin.rooms.get(f"synthetic:{n}").claim(f"pending:{n}", 0)
     event, bot = adapter_event(kind)
     await pipeline(env, event, adapter=True)
-    assert bot.transport.await_count == 1, payload(bot)
+    assert bot.transport.await_count == 0, payload(bot)
     assert not event.get_extra(MARK)
     assert len(env.plugin.rooms.rooms) == env.plugin.rooms.capacity

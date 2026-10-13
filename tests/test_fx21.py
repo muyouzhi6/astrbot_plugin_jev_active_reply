@@ -1,6 +1,7 @@
 """Release-21 regressions for a redelivered explicit request."""
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -90,9 +91,11 @@ async def test_scheduler_redelivery_does_not_start_second_generation(
 
 
 @pytest.mark.asyncio
-async def test_cancelled_admission_is_not_reclassified_as_failure(env):
+async def test_cancelled_admission_is_not_reclassified_as_failure(env, monkeypatch):
     wake.configure(env)
-    env.plugin.client.evaluate.side_effect = asyncio.CancelledError()
+    monkeypatch.setattr(
+        bridge, "build_snapshot", AsyncMock(side_effect=asyncio.CancelledError())
+    )
     event, bot = adapter_event("at")
 
     await env.plugin.on_input(event)
@@ -133,7 +136,7 @@ async def test_online_wake_miss_modes_have_one_terminal_send(
         await pipeline(env, event, "[PASS]。", adapter=True)
     else:
         if mode == "history_advanced":
-            evaluate = env.plugin.client.evaluate
+            evaluate = bridge.build_snapshot
 
             async def advance(*args):
                 answer = await evaluate(*args)
@@ -141,7 +144,7 @@ async def test_online_wake_miss_modes_have_one_terminal_send(
                 env.plugin.rooms.get(event.unified_msg_origin).generation += 2
                 return answer
 
-            monkeypatch.setattr(env.plugin.client, "evaluate", advance)
+            monkeypatch.setattr(bridge, "build_snapshot", advance)
         entered, release = asyncio.Event(), asyncio.Event()
         task = asyncio.create_task(
             pipeline(
@@ -173,6 +176,10 @@ async def test_online_wake_miss_modes_have_one_terminal_send(
             release.set()
             await asyncio.wait_for(task, 4)
 
+    if mode in {"candidate_timeout", "lease_expired"}:
+        bot.transport.assert_not_awaited()
+        assert not env.plugin.rooms.get(event.unified_msg_origin).pending
+        return
     body = platform_payload(bot)
     assert '"type": "image"' in body if mode == "external_media_stop" else body
     assert silence.FALLBACK_REPLY in body or '"type": "image"' in body

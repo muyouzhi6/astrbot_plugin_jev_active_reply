@@ -539,7 +539,7 @@ async def test_explicit_marker_delivers_once(env, kind, stage, text):
     if stage == "response":
         assert responses[0].completion_text == delivered
         assert responses[0].result_chain.get_plain_text() == delivered
-    env.plugin.client.evaluate.assert_awaited_once()
+    env.plugin.client.evaluate.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -711,7 +711,7 @@ async def test_slow_generation_queues_required_wakes_past_candidate_deadline(
         else:
             await assert_one_reply(env, second, second_send, total=2)
             assert len(responses) == 1
-            assert env.plugin.client.evaluate.await_count == 2
+            assert env.plugin.client.evaluate.await_count == 0
     finally:
         release.set()
         for task in (one, two):
@@ -773,7 +773,7 @@ async def test_room_update_during_admission_keeps_explicit_reply(
         await release.wait()
 
     async def build_snapshot(context, ev, *args):
-        if ev is event and phase == "snapshot":
+        if ev is event and (phase == "snapshot" or kind != "natural"):
             await pause()
         return await snapshot(context, ev, *args)
 
@@ -826,23 +826,24 @@ async def test_room_update_during_admission_keeps_explicit_reply(
 
 
 @pytest.mark.asyncio
-async def test_private_judge_unaffected_by_other_group(env):
+async def test_private_judge_unaffected_by_other_group(env, monkeypatch):
     wake.configure(env)
     wake.judge_result(env, "reply")
     private = wake.request_event("private")
     entered, release = asyncio.Event(), asyncio.Event()
-    calls = 0
+    snapshot = bridge.build_snapshot
 
-    async def judge(*args):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
+    async def build(context, event, *args):
+        if event is private:
             entered.set()
             await release.wait()
-            return env.plugin.client.evaluate.return_value
-        return {**env.response, "values": {"reply_now": 0}}
+        return await snapshot(context, event, *args)
 
-    env.plugin.client.evaluate.side_effect = judge
+    monkeypatch.setattr(bridge, "build_snapshot", build)
+    env.plugin.client.evaluate.return_value = {
+        **env.response,
+        "values": {"reply_now": 0},
+    }
     task = asyncio.create_task(pipeline(env, private))
     try:
         await asyncio.wait_for(entered.wait(), 2)

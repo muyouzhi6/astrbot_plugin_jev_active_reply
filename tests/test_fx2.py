@@ -7,7 +7,7 @@ import pytest
 from astrbot.api.message_components import Node, Plain
 from astrbot.core.pipeline.respond.stage import RespondStage
 
-from .. import bridge, silence
+from .. import bridge
 from ..delivery import DeliveryDeclined
 from ..main import MARK
 from . import test_v0101_explicit_wake as wake
@@ -42,14 +42,14 @@ async def test_late_consumed_and_split_marker(env, native, texts):
 
 
 @pytest.mark.asyncio
-async def test_candidate_timeout_has_reply(env, monkeypatch):
+async def test_candidate_timeout_is_silent(env, monkeypatch):
     wake.configure(env)
     event, bot = adapter_event("at")
     monkeypatch.setattr(bridge, "native_busy", lambda ev: True)
     monkeypatch.setattr(env.plugin, "_lifetime", lambda: 0.02)
     await env.plugin.on_input(event)
     await env.plugin.on_message(event)
-    assert bot.transport.await_count == 1
+    assert bot.transport.await_count == 0
     assert event.is_stopped()
 
 
@@ -80,10 +80,7 @@ async def test_lease_rejects_late_send(env):
     await asyncio.sleep(0.05)
     with pytest.raises(DeliveryDeclined):
         await event.send(event.plain_result("Late answer"))
-    assert bot.transport.await_count == 1
-    assert silence.FALLBACK_REPLY in json.dumps(
-        bot.transport.await_args.kwargs, ensure_ascii=False
-    )
+    assert bot.transport.await_count == 0
 
 
 @pytest.mark.asyncio
@@ -141,14 +138,14 @@ async def test_marker_punctuation_before_node(env):
 async def test_history_advance_during_judge(env, monkeypatch):
     wake.configure(env)
     wake.judge_result(env, "reply")
-    original = env.plugin.client.evaluate
+    original = bridge.build_snapshot
 
     async def judge(*args):
         result = await original(*args)
         monkeypatch.setattr(bridge, "fingerprint", lambda conv: "advanced")
         return result
 
-    monkeypatch.setattr(env.plugin.client, "evaluate", judge)
+    monkeypatch.setattr(bridge, "build_snapshot", judge)
     event, bot = adapter_event("at")
     await pipeline(env, event, adapter=True)
     assert bot.transport.await_count == 1
@@ -175,6 +172,6 @@ async def test_dispatched_terminal(env, mode):
     else:
         env.plugin._expire(event)
         await asyncio.sleep(0.05)
-    assert bot.transport.await_count == 1
+    assert bot.transport.await_count == (0 if mode == "lease" else 1)
     assert event.get_extra(MARK)["finished"]
     assert not env.plugin.rooms.get(event.unified_msg_origin).pending

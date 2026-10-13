@@ -100,7 +100,7 @@ async def test_online_lifecycle(env, monkeypatch, kind, mode):
     else:
         entered, release = asyncio.Event(), asyncio.Event()
         if mode == "superseded":
-            original = env.plugin.client.evaluate
+            original = bridge.build_snapshot
 
             async def judge(*args):
                 result = await original(*args)
@@ -108,7 +108,7 @@ async def test_online_lifecycle(env, monkeypatch, kind, mode):
                 monkeypatch.setattr(bridge, "fingerprint", lambda conv: "advanced")
                 return result
 
-            env.plugin.client.evaluate = judge
+            monkeypatch.setattr(bridge, "build_snapshot", judge)
         task = asyncio.create_task(
             pipeline(env, event, adapter=True, generation_gate=(entered, release))
         )
@@ -130,7 +130,9 @@ async def test_online_lifecycle(env, monkeypatch, kind, mode):
             await asyncio.sleep(0.05)
         release.set()
         await task
-    assert bot.transport.await_count == 1, payload(bot)
+    assert bot.transport.await_count == (0 if mode in {"wait", "lease"} else 1), (
+        payload(bot)
+    )
     assert "[PASS]" not in payload(bot)
     assert not env.plugin.rooms.get(event.unified_msg_origin).pending
 

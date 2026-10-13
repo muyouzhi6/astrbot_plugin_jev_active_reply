@@ -125,6 +125,22 @@ class PolicyTests(unittest.TestCase):
                 self.__dict__.update(attrs)
 
         class Event:
+            is_at_or_wake_command = False
+
+            def get_sender_id(self):
+                return "human"
+
+            def get_group_id(self):
+                return "group"
+
+            def is_private_chat(self):
+                return False
+
+            def is_admin(self):
+                return False
+
+            unified_msg_origin = "test:GroupMessage:group"
+
             def __init__(self, text, parts):
                 self.text, self.parts = text, parts
 

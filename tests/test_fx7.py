@@ -33,12 +33,12 @@ async def test_later_conversation_failure(env, monkeypatch, kind, fail_at, persi
 
     monkeypatch.setattr(bridge, "conversation", read)
     await pipeline(env, event, adapter=True)
-    assert bot.transport.await_count == 1
-    assert any(texts(bot))
+    assert bot.transport.await_count == (0 if persistent else 1)
+    assert bool(texts(bot)) == (not persistent)
     assert not env.plugin.rooms.get(event.unified_msg_origin).pending
     assert not event.get_extra(MARK, {}).get("lease")
     if persistent:
-        assert texts(bot) == [silence.FALLBACK_REPLY]
+        assert texts(bot) == []
 
 
 @pytest.mark.asyncio
@@ -108,7 +108,7 @@ async def test_online_lifecycle(env, monkeypatch, kind, mode):
         await pipeline(env, event, adapter=True)
     else:
         if mode == "history":
-            original = env.plugin.client.evaluate
+            original = bridge.build_snapshot
 
             async def judge(*args):
                 response = await original(*args)
@@ -116,7 +116,7 @@ async def test_online_lifecycle(env, monkeypatch, kind, mode):
                 monkeypatch.setattr(bridge, "fingerprint", lambda conv: "new-history")
                 return response
 
-            monkeypatch.setattr(env.plugin.client, "evaluate", judge)
+            monkeypatch.setattr(bridge, "build_snapshot", judge)
         entered, release = asyncio.Event(), asyncio.Event()
         task = asyncio.create_task(
             pipeline(
@@ -153,6 +153,6 @@ async def test_online_lifecycle(env, monkeypatch, kind, mode):
             if not task.done():
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-    assert bot.transport.await_count == 1
+    assert bot.transport.await_count == (0 if mode in {"wait", "lease"} else 1)
     assert "[PASS]" not in str(bot.transport.await_args_list)
     assert not env.plugin.rooms.get(event.unified_msg_origin).pending

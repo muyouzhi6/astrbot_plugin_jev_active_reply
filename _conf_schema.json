@@ -3,13 +3,13 @@
     "type": "bool",
     "default": false,
     "description": "Jev 接管 @、昵称与前缀呼叫",
-    "hint": "开启后先判断再回复，连续补充参与合并；已注册的命令继续交给 AstrBot。"
+    "hint": "开启后直接回复 @、昵称与前缀呼叫，连续补充参与合并；已注册的命令继续交给 AstrBot。"
   },
   "enable_private_chat": {
     "type": "bool",
     "default": false,
     "description": "私聊启用 Jev",
-    "hint": "私聊用户号或完整会话标识也需加入启用会话；沿用忽略名单与消息合并设置。"
+    "hint": "开启后私聊直接回复，不受群工作范围影响；沿用忽略名单与消息合并设置。"
   },
   "relay_mode": {
     "type": "string",
@@ -67,9 +67,34 @@
   "enabled_sessions": {
     "type": "list",
     "default": [],
-    "description": "启用会话",
-    "hint": "填写群号、私聊用户号或完整会话标识；填 * 表示全部。私聊需打开私聊开关。",
-    "invisible": false
+    "description": "旧版启用会话",
+    "hint": "升级时迁移至插件工作群列表；请使用群工作范围设置。",
+    "invisible": true
+  },
+  "group_scope_mode": {
+    "type": "string",
+    "default": "whitelist",
+    "options": ["whitelist", "blacklist"],
+    "description": "插件启用范围模式",
+    "hint": "决定插件在哪些群工作。whitelist：只在 scope_groups 中的群启用；blacklist：除这些群外都启用。私聊由私聊开关控制；直接回复白名单不改变工作范围。"
+  },
+  "scope_groups": {
+    "type": "list",
+    "default": ["215532038", "1108263703", "741379052"],
+    "description": "插件工作群列表",
+    "hint": "填写群号，配合 group_scope_mode 决定插件在哪些群工作。与直接回复白名单不同，本项不决定是否跳过判断。"
+  },
+  "whitelist_users": {
+    "type": "list",
+    "default": [],
+    "description": "直接回复用户白名单",
+    "hint": "填写 QQ 号。在插件工作范围内，这些人的消息不经判断直接回；忽略名单等显式屏蔽仍生效。本项不增加工作群。"
+  },
+  "whitelist_groups": {
+    "type": "list",
+    "default": [],
+    "description": "直接回复群白名单",
+    "hint": "填写群号。在插件工作范围内，这些群的消息不经判断直接回；忽略名单等显式屏蔽仍生效。插件在哪些群工作由 group_scope_mode 和 scope_groups 决定。"
   },
   "nanbei": {
     "type": "object",
@@ -643,9 +668,9 @@
           "reply_to_bot_wakes": {
             "type": "bool",
             "default": true,
-            "description": "引用 Bot 时直接回应",
-            "invisible": false,
-            "hint": ""
+            "description": "旧版引用回复开关",
+            "invisible": true,
+            "hint": "引用机器人消息直接进入回复流程；此旧设置不再控制引用回复。"
           },
           "skip_reply_to_others": {
             "type": "bool",

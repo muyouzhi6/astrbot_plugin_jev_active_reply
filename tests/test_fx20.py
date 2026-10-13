@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from .. import bridge, silence
+from .. import bridge
 from . import test_v0101_explicit_wake as wake
 from .test_v0102_wake_warnings import (
     adapter_event,
@@ -26,13 +26,13 @@ async def test_capacity_exhaustion_closes_required_delivery(env, kind, body):
         env.plugin.rooms.get(f"synthetic:{index}").claim(f"owner:{index}", 0)
     event, bot = adapter_event(kind)
     await pipeline(env, event, body, adapter=True)
-    assert silence.FALLBACK_REPLY in platform_payload(bot)
-    assert event.get_extra("_jev_send_sequence") == 1
-    assert event.get_extra("_jev_delivery_state") == "completed"
+    bot.transport.assert_not_awaited()
+    assert not event.get_extra("_jev_send_sequence")
+    assert event.is_stopped()
     assert len(env.plugin.rooms.rooms) == env.plugin.rooms.capacity
     await env.plugin.on_message(event)
     await env.plugin._context_failure_reply(event)
-    assert bot.transport.await_count == 1
+    assert bot.transport.await_count == 0
 
 
 @pytest.mark.asyncio
@@ -58,7 +58,7 @@ async def test_online_miss_modes_close_once(env, monkeypatch, kind, mode):
         await pipeline(env, event, "[PASS]。", adapter=True)
     else:
         if mode == "superseded":
-            original = env.plugin.client.evaluate
+            original = bridge.build_snapshot
 
             async def advance(*args):
                 answer = await original(*args)
@@ -66,7 +66,7 @@ async def test_online_miss_modes_close_once(env, monkeypatch, kind, mode):
                 env.plugin.rooms.get(event.unified_msg_origin).generation += 1
                 return answer
 
-            monkeypatch.setattr(env.plugin.client, "evaluate", advance)
+            monkeypatch.setattr(bridge, "build_snapshot", advance)
         entered, release = asyncio.Event(), asyncio.Event()
         task = asyncio.create_task(
             pipeline(
@@ -98,6 +98,10 @@ async def test_online_miss_modes_close_once(env, monkeypatch, kind, mode):
         finally:
             release.set()
             await task
+    if mode in {"candidate_timeout", "lease_timeout"}:
+        bot.transport.assert_not_awaited()
+        assert not env.plugin.rooms.get(event.unified_msg_origin).pending
+        return
     value = platform_payload(bot)
     assert '"type": "image"' in value if mode == "external_media_stop" else value
     assert event.get_extra("_jev_send_sequence") == 1

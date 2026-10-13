@@ -215,7 +215,7 @@ def test_real_core_schema_roundtrip_preserves_old_values_and_new_ui_edits(tmp_pa
     assert len(again) == len(dict(again))
     for group, keys in GROUPS.items():
         assert all(again.raw["advanced"][group][key] is not None for key in keys)
-    assert len([field for field in schema.values() if not field.get("invisible")]) == 15
+    assert len([field for field in schema.values() if not field.get("invisible")]) == 18
     assert schema["advanced"]["condition"] == {"show_advanced": True}
     assert schema["dry_run"]["invisible"] and not again["dry_run"]
 

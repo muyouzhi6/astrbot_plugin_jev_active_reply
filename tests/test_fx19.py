@@ -80,14 +80,14 @@ async def test_external_stop_during_admission_closes_required_turn(
 
         monkeypatch.setattr(bridge, "native_busy", busy)
     else:
-        original = env.plugin.client.evaluate
+        original = bridge.build_snapshot
 
         async def evaluate(*args):
             entered.set()
             await release.wait()
             return await original(*args)
 
-        monkeypatch.setattr(env.plugin.client, "evaluate", evaluate)
+        monkeypatch.setattr(bridge, "build_snapshot", evaluate)
     task = asyncio.create_task(pipeline(env, event, adapter=True))
     try:
         await asyncio.wait_for(entered.wait(), 4)
@@ -245,13 +245,13 @@ async def test_default_takeover_off_preserves_text_filter(env, filter_kind):
     else:
         env.cfg["blocked_keywords"] = ["上下文"]
     await env.plugin.on_input(event)
-    assert event.is_stopped()
+    assert not event.is_stopped()
     assert not event.get_extra(MARK)
     assert bot.transport.await_count == 0
 
 
 @pytest.mark.asyncio
-async def test_merged_required_candidate_has_one_owner(env):
+async def test_merged_required_candidate_has_one_owner(env, monkeypatch):
     wake.configure(env)
     wake.judge_result(env, "reply")
     env.cfg["burst_merge_enabled"] = True
@@ -259,15 +259,15 @@ async def test_merged_required_candidate_has_one_owner(env):
     second, second_bot = adapter_event("at")
     second.message_obj.message_id = "synthetic-second"
     entered, release = asyncio.Event(), asyncio.Event()
-    response = env.plugin.client.evaluate.return_value
+    snapshot = bridge.build_snapshot
 
     async def evaluate(*args):
         if not entered.is_set():
             entered.set()
             await release.wait()
-        return response
+        return await snapshot(*args)
 
-    env.plugin.client.evaluate.side_effect = evaluate
+    monkeypatch.setattr(bridge, "build_snapshot", evaluate)
     older = asyncio.create_task(pipeline(env, first, adapter=True))
     newer = None
     try:

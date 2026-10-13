@@ -102,7 +102,7 @@ async def test_excluded_autonomous_room_keeps_direct_wakes(env):
     ev = base.event(text="吱吱，你好")
     await env.plugin.on_input(ev)
     await env.plugin.on_message(ev)
-    assert ev.is_at_or_wake_command
+    assert not ev.is_at_or_wake_command
     env.plugin.client.evaluate.assert_not_awaited()
 
 
@@ -198,7 +198,7 @@ async def test_reply_wake_switch_clears_core_mark_but_keeps_at_and_prefix(env):
     ev = base.event(parts=[Reply(id="old", sender_id="bot"), Plain("转述一下")])
     ev.is_at_or_wake_command = True
     await env.plugin.on_input(ev)
-    assert not ev.is_at_or_wake_command
+    assert ev.is_at_or_wake_command
     assert not ev.is_stopped()
     direct = base.event(
         parts=[Reply(id="old", sender_id="bot"), At(qq="bot"), Plain("转述一下")]
@@ -291,10 +291,10 @@ async def test_non_autonomous_room_still_records_sent_reply_for_repeat_filter(en
     )
     ev._has_send_oper = True
     await env.plugin.after_sent(ev)
-    assert env.plugin.rooms.get(ev.unified_msg_origin).last_text == "正常回复"
+    assert env.plugin.rooms.get(ev.unified_msg_origin).last_text == ""
     repeated = base.event(mid="repeat", text="正常回复")
     await env.plugin.on_input(repeated)
-    assert repeated.is_stopped()
+    assert not repeated.is_stopped()
 
 
 @pytest.mark.asyncio

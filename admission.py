@@ -115,6 +115,8 @@ def explicit_wake(event, config):
 
 def requires_reply(event, config):
     """Recognize user requests without mistaking Jev's native re-arm for a wake."""
+    if direct_whitelist(event, config):
+        return True
     if event.is_private_chat():
         return bool(
             str(
@@ -135,9 +137,23 @@ def requires_reply(event, config):
     return input_decision(event, config)[0] == "direct"
 
 
+def direct_whitelist(event, config):
+    return str(event.get_sender_id()) in {
+        str(value) for value in config.get("whitelist_users", [])
+    } or (
+        not event.is_private_chat()
+        and str(event.get_group_id())
+        in {str(value) for value in config.get("whitelist_groups", [])}
+    )
+
+
 def local_prefilter(event, config, recent_text="", recent_at=0.0, now=0.0):
     """Filter content-free interjections and repeated declined topics, not photos."""
-    if not config.get("local_prefilter_enabled", True) or explicit_wake(event, config):
+    if (
+        not config.get("local_prefilter_enabled", True)
+        or explicit_wake(event, config)
+        or requires_reply(event, config)
+    ):
         return None
     parts = event.get_messages()
     # Platform image sub_type=1 is a sticker; ordinary images still use text_gate.
@@ -255,13 +271,10 @@ def input_decision(event, config, recent_bot_text="", prefixes=()):
             named = True
             remainder = plain[match.end() :].strip(" ,，:：!！?？。~～")
             break
-    protected = (
-        config.get("takeover_wake_messages", False)
-        or (event.is_private_chat() and config.get("enable_private_chat", False))
-    ) and (
+    protected = direct_whitelist(event, config) or (
         event.is_private_chat()
         or at_self
-        or (reply_self and config.get("reply_to_bot_wakes", True))
+        or reply_self
         or (
             named
             and not directed_other
@@ -320,6 +333,8 @@ def input_decision(event, config, recent_bot_text="", prefixes=()):
                 "block_prefixed_commands" if registered else "block_prefixed_llm", False
             ):
                 return "block", "blocked_prefix"
+    if direct_whitelist(event, config):
+        return "direct", "direct_reply_whitelist"
     if not (at_self or reply_self) and directed_other:
         return "skip", "addressed_elsewhere"
     if (
@@ -338,10 +353,8 @@ def input_decision(event, config, recent_bot_text="", prefixes=()):
             return "resume", "explicit_resume_request"
     if at_self:
         return "direct", "explicit_at"
-    if reply_self and config.get("reply_to_bot_wakes", True):
+    if reply_self:
         return "direct", "reply_to_bot"
     if named:
         return "direct", "named_wake"
-    if reply_self and not config.get("reply_to_bot_wakes", True):
-        return "skip", "reply_wake_disabled"
     return "pass", "not_explicitly_addressed"

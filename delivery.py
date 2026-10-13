@@ -80,6 +80,9 @@ def install_completion_adapter():
     from astrbot.core.pipeline.process_stage.stage import ProcessStage
     from astrbot.core.pipeline.respond.stage import RespondStage
     from astrbot.core.pipeline.scheduler import PipelineScheduler
+    from astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal import (
+        InternalAgentSubStage,
+    )
 
     original = ProcessStage.process
     if getattr(original, "_jev_completion", False):
@@ -90,6 +93,11 @@ def install_completion_adapter():
         try:
             async for item in original(stage, event):
                 yield item
+        except BaseException:
+            failed = event.get_extra("_jev_generation_failed")
+            if failed is not None:
+                failed()
+            raise
         finally:
             finish = event.get_extra("_jev_complete_output")
             if finish is not None:
@@ -97,6 +105,18 @@ def install_completion_adapter():
 
     process._jev_completion = True
     ProcessStage.process = process
+
+    original_error = InternalAgentSubStage._send_llm_error_message
+
+    @wraps(original_error)
+    async def error(stage, event, message):
+        failed = event.get_extra("_jev_generation_failed")
+        if failed is not None:
+            failed()
+            return
+        return await original_error(stage, event, message)
+
+    InternalAgentSubStage._send_llm_error_message = error
 
     original_stages = PipelineScheduler._process_stages
 
@@ -126,6 +146,19 @@ def install_completion_adapter():
 
 class DeliveryDeclined(Exception):
     pass
+
+
+def is_message_action(action):
+    # OneBot async/rate-limited variants still send messages, unlike send_like/poke.
+    name = str(action)
+    for suffix in ("_async", "_rate_limited"):
+        name = name.removesuffix(suffix)
+    return name in {
+        "send",
+        "send_group_ai_record",
+        "forward_group_single_msg",
+        "forward_friend_single_msg",
+    } or (name.startswith("send_") and name.endswith("_msg"))
 
 
 def _native_segments(value, *, auto_escape=False):
@@ -242,7 +275,13 @@ def native_delivery(event, action, args, params):
     kind = "group" if group else "private"
     if (
         action
-        not in {"send", "send_msg", f"send_{kind}_msg", f"send_{kind}_forward_msg"}
+        not in {
+            "send",
+            "send_msg",
+            "send_forward_msg",
+            f"send_{kind}_msg",
+            f"send_{kind}_forward_msg",
+        }
         or str(target.get(key, "")) != str(expected)
         or (action != "send" and target.get("user_id" if group else "group_id"))
         or target.get("message_type", kind) != kind
@@ -260,14 +299,7 @@ class EventBotProxy:
 
     def __getattr__(self, name):
         original = getattr(self._bot, name)
-        if name in {
-            "send",
-            "send_msg",
-            "send_group_msg",
-            "send_private_msg",
-            "send_group_forward_msg",
-            "send_private_forward_msg",
-        }:
+        if is_message_action(name):
 
             async def guarded(*args, **kwargs):
                 return await self._sender(original, *args, _jev_action=name, **kwargs)
@@ -276,7 +308,7 @@ class EventBotProxy:
         if name == "call_action":
 
             async def action(action, *args, **kwargs):
-                if str(action).startswith("send_"):
+                if is_message_action(action):
                     return await self._sender(
                         original, action, *args, _jev_action="call_action", **kwargs
                     )

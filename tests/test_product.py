@@ -110,6 +110,8 @@ def test_patch_removes_only_legacy_duplicates_and_preserves_effective_values():
     # 0.10.1 folds primary_channel into the single relay_mode selector.
     expected["relay_mode"] = expected.pop("primary_channel")
     expected["_relay_config_version"] = 1
+    expected["scope_groups"] = expected["enabled_sessions"]
+    expected["group_scope_mode"] = "whitelist"
     assert first == second == expected
     assert set(patch["set"]) == {"advanced.context.interest_topics"}
     assert set(patch["delete_top_level"]) == {

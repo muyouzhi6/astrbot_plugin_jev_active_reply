@@ -30,13 +30,13 @@ async def test_ingress_conversation_failure(env, monkeypatch, kind, persistent):
 
     monkeypatch.setattr(bridge, "conversation", transient)
     await pipeline(env, event, adapter=True)
-    assert bot.transport.await_count == 1, (
+    assert bot.transport.await_count == 0, (
         event.is_stopped(),
         event.get_extra(MARK),
         payload(bot),
     )
     assert event.is_stopped()
-    assert "我在，请再说一下你的问题。" in payload(bot)
+    assert "我在，请再说一下你的问题。" not in payload(bot)
 
 
 @pytest.mark.asyncio
@@ -166,6 +166,13 @@ async def test_completion_waits_for_transport(env, monkeypatch, expired, fail):
         finishing = asyncio.create_task(
             env.plugin._complete_output(event, expired=expired)
         )
+        if expired:
+            await finishing
+            assert bot.transport.await_count == 0
+            assert sending.result().status == "cancelled"
+            assert event.get_extra(MARK)["finished"]
+            assert not env.plugin.rooms.get(event.unified_msg_origin).pending
+            return
         await asyncio.wait_for(entered.wait(), 3)
         await asyncio.sleep(0.02)
         assert not finishing.done()

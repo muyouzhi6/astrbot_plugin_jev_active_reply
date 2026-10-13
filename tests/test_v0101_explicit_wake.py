@@ -85,7 +85,7 @@ async def test_non_admin_explicit_request_always_delivers(env, kind, outcome):
     assert not ev.is_stopped()
     assert ev.get_extra(MARK)["committed"]
     assert env.plugin.metrics.replies == 1
-    env.plugin.client.evaluate.assert_awaited_once()
+    env.plugin.client.evaluate.assert_not_awaited()
     req = ev.get_extra("_test_generation_request")
     assert req.func_tool.names() == ["web_search"]
     guidance = "\n".join(part.text for part in req.extra_user_content_parts)
@@ -167,9 +167,11 @@ async def test_unavailable_jev_snapshot_still_delivers(env, monkeypatch, kind):
 
 
 @pytest.mark.asyncio
-async def test_cancelled_judge_does_not_revive_cancelled_turn(env):
+async def test_cancelled_snapshot_does_not_revive_cancelled_turn(env, monkeypatch):
     configure(env)
-    env.plugin.client.evaluate.side_effect = asyncio.CancelledError()
+    monkeypatch.setattr(
+        bridge, "build_snapshot", AsyncMock(side_effect=asyncio.CancelledError())
+    )
     ev = request_event("at")
     await env.plugin.on_input(ev)
     with pytest.raises(asyncio.CancelledError):

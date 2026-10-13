@@ -14,7 +14,7 @@ from astrbot.api.message_components import Image, Plain
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 
 from ..client import Adapter, JevClient, KeyPool
-from ..delivery import DeliveryDeclined, SplitAdapters
+from ..delivery import SplitAdapters
 from ..main import MARK
 from ..policy import QUESTIONS, is_refusal, pack_state, questions_for
 from ..state import Ledger
@@ -211,10 +211,9 @@ async def test_core_technical_error_is_suppressed(env):
     original_send = AsyncMock()
     ev.send = original_send
     await env.admit(ev)
-    with pytest.raises(DeliveryDeclined):
-        await InternalAgentSubStage._send_llm_error_message(
-            object(), ev, "technical failure"
-        )
+    await InternalAgentSubStage._send_llm_error_message(
+        object(), ev, "technical failure"
+    )
     original_send.assert_not_awaited()
     assert not env.plugin.rooms.get(ev.unified_msg_origin).pending
 

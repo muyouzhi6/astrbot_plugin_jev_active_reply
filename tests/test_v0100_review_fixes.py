@@ -48,7 +48,7 @@ async def test_runtime_settings_preserve_one_reply_and_native_tools(
     assert "web_search" in [tool.name for tool in request.func_tool.tools]
     assert env.settings == original
     if takeover:
-        env.plugin.client.evaluate.assert_awaited_once()
+        env.plugin.client.evaluate.assert_not_awaited()
         assert ev.get_extra(MARK)["committed"]
         assert ev.get_extra("enable_streaming") is False
         assert await env.plugin.ledger.acount(ev.unified_msg_origin, "sent") == 1
@@ -150,7 +150,7 @@ async def test_private_quiet_persists_blocks_and_resumes(env, scope):
     reopened = incoming("private", "reopened")
     await pipeline(env, reopened, sent)
     assert sent == [reopened]
-    env.plugin.client.evaluate.assert_awaited_once()
+    env.plugin.client.evaluate.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -177,7 +177,10 @@ async def test_private_management_respects_enablement_and_scope(env, operation, 
     before = time.monotonic() + 600 if operation == "resume_room" else 0
     room.quiet_until = before
     assert [result async for result in getattr(env.plugin, operation)(ev)]
-    assert room.quiet_until == before
+    if reason == "unlisted":
+        assert (room.quiet_until > time.monotonic()) == (operation == "quiet_room")
+    else:
+        assert room.quiet_until == before
 
 
 @pytest.mark.asyncio
@@ -248,7 +251,7 @@ async def test_takeover_bypasses_provider_wake_prefix_after_jev_admission(
     assert "unsupported_runtime_settings" not in [
         reason for _, reason, _ in env.plugin.audit_queue
     ]
-    assert env.plugin.client.evaluate.await_count == 1
+    assert env.plugin.client.evaluate.await_count == 0
 
 
 @pytest.mark.asyncio
@@ -307,7 +310,7 @@ async def test_provider_prefix_respects_disabled_takeover_and_allows_explicit_wa
     transport.assert_awaited_once()
     assert transport.await_args.args[0].get_plain_text() == "合成的回答"
     explicit.stop_event.assert_not_called()
-    env.plugin.client.evaluate.assert_awaited_once()
+    env.plugin.client.evaluate.assert_not_awaited()
     assert env.plugin.metrics.replies == 1
     assert await env.plugin.ledger.acount(explicit.unified_msg_origin, "sent") == 1
 
@@ -358,7 +361,9 @@ async def test_prefix_shim_restores_event_when_generation_is_rejected(env, reaso
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["at", "private"])
 @pytest.mark.parametrize("phase", ["judge", "generate"])
-async def test_provider_prefix_burst_keeps_one_native_reply(env, kind, phase):
+async def test_provider_prefix_burst_keeps_one_native_reply(
+    env, monkeypatch, kind, phase
+):
     env.cfg.update(
         takeover_wake_messages=True,
         enable_private_chat=True,
@@ -370,14 +375,17 @@ async def test_provider_prefix_burst_keeps_one_native_reply(env, kind, phase):
     first = incoming(kind, "first", "看看模型上下文")
     second = incoming(kind, "second", "补充模型上下文的问题")
     sent, prompts = [], []
+    from .. import bridge
+
+    snapshot = bridge.build_snapshot
 
     async def judge(*args):
         if phase == "judge" and not entered.is_set():
             entered.set()
             await release.wait()
-        return deepcopy(env.response)
+        return await snapshot(*args)
 
-    env.plugin.client.evaluate.side_effect = judge
+    monkeypatch.setattr(bridge, "build_snapshot", judge)
 
     async def native_reply(event):
         event.send = AsyncMock()

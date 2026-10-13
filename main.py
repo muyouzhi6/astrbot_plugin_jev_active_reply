@@ -32,6 +32,7 @@ from . import bridge, silence, burst
 from .admission import (
     awaiting_image,
     correction,
+    direct_whitelist,
     guard_exempt,
     input_decision,
     local_prefilter,
@@ -42,6 +43,7 @@ from .client import DecisionError, JevClient
 from .delivery import (
     DeliveryDeclined,
     EventBotProxy,
+    QueuedDelivery,
     native_delivery,
     SplitAdapters,
     install_completion_adapter,
@@ -59,7 +61,7 @@ from .policy import (
 )
 from .state import Ledger, RoomBook, scope_id, audit_preview
 from .telemetry import Metrics
-from .settings import ConfigView, migrate_config_file
+from .settings import ConfigView, DEFAULT_SCOPE_GROUPS, migrate_config_file
 from pathlib import Path
 from astrbot.core.utils.astrbot_path import get_astrbot_config_path
 
@@ -135,8 +137,17 @@ class JevActiveReply(Star):
             or event.get_platform_name() != "aiocqhttp"
         ):
             return False
-        allow = self._cfg("enabled_sessions", [])
-        return any(x in allow for x in ("*", *self._session_targets(event)))
+        if event.is_private_chat():
+            return True
+        groups = {
+            str(value) for value in self._cfg("scope_groups", DEFAULT_SCOPE_GROUPS)
+        }
+        listed = bool(groups.intersection(("*", *self._session_targets(event))))
+        return (
+            not listed
+            if self._cfg("group_scope_mode", "whitelist") == "blacklist"
+            else listed
+        )
 
     @staticmethod
     def _session_targets(event):
@@ -180,8 +191,7 @@ class JevActiveReply(Star):
         cfg = self._silence_settings()
         scopes = cfg.get("sessions", ["*"])
         return (
-            not self.closed
-            and self._cfg("enabled", True)
+            self._enabled(event)
             and not self._cfg("dry_run", False)
             and cfg.get("enable", True)
             and any(
@@ -306,6 +316,13 @@ class JevActiveReply(Star):
             silence.clear_output(event, response)
 
     def _note(self, event, reason, details=None):
+        logger.info(
+            "[JevActive] reason=%s session=%s sender=%s message_id=%s",
+            reason,
+            event.unified_msg_origin,
+            str(event.get_sender_id()),
+            str(getattr(event.message_obj, "message_id", "")),
+        )
         if self.closed:
             return
         meta = event.get_extra(MARK)
@@ -423,6 +440,7 @@ class JevActiveReply(Star):
             or meta.get("finished")
             or event.get_extra("_jev_context_unavailable")
         ):
+            self._note(event, "delivery_not_active")
             return False
         if room:
             await self._load_quiet(event, room)
@@ -441,6 +459,8 @@ class JevActiveReply(Star):
         except Exception:
             if not self._must_reply(event):
                 self._reject(event, None, "delivery_context_unavailable")
+            else:
+                self._note(event, "delivery_context_unavailable")
             return False
         # Revalidate after the final await: expiry/recall/replacement may have won.
         if (
@@ -451,6 +471,7 @@ class JevActiveReply(Star):
             or meta.get("finished")
             or self._quiet(event, room)
         ):
+            self._note(event, "delivery_cancelled_after_context_read")
             return False
         if await self._finish_expired(event, "delivery_expired"):
             return False
@@ -490,42 +511,22 @@ class JevActiveReply(Star):
                     raise
 
     async def _context_failure_reply(self, event):
+        # Storage/admission failures are operational events, not chat content.
+        if not (
+            event.get_extra("_jev_context_unavailable")
+            or event.get_extra("_jev_admission_failed")
+        ):
+            return
         meta = event.get_extra(MARK, {})
         if meta:
             await self._wait_delivery(meta)
-        room = self.rooms.rooms.get(event.unified_msg_origin)
-        send = event.get_extra("_jev_context_failure_sender")
-        if (
-            not send
-            or not (
-                event.get_extra("_jev_context_unavailable")
-                or event.get_extra("_jev_admission_failed")
-            )
-            or event.get_extra("_jev_quiet_unavailable")
-            or event.get_extra("_jev_context_failure_attempted")
-            or event.get_extra("_jev_send_sequence", 0)
-            or self.closed
-            or self._blocked(event)
-            or event.get_extra(silence.RECALL)
-            or self._quiet(event, room)
-            or meta.get("rejected")
-            or meta.get("sent_parts")
-        ):
-            return
-        # No conversation-dependent draft may escape while storage is unavailable.
-        # Record the attempt before transport; an ambiguous failure is not retried.
-        event.set_extra("_jev_context_failure_attempted", True)
-        if meta and getattr(event, "bot", None) is not None:
-            await send(event.plain_result(silence.FALLBACK_REPLY))
+            self._reject(event, None, "internal_failure_suppressed")
+            meta["finished"] = True
         else:
-            await self._send_audited(
-                event, send, (event.plain_result(silence.FALLBACK_REPLY),), {}
-            )
-        if meta:
-            await self._accepted(event)
+            self._note(event, "internal_failure_suppressed")
+        silence.clear_output(event)
         burst.close(event)
         event.stop_event()
-        self._note(event, "conversation_failure_replied")
 
     @staticmethod
     def _quiet(event, room):
@@ -696,6 +697,10 @@ class JevActiveReply(Star):
             return False
 
         event.set_extra("_jev_buffered_content", buffered_content)
+        event.set_extra(
+            "_jev_generation_failed",
+            lambda: self._reject(event, None, "generation_failed"),
+        )
 
         def contains_media(value):
             return any(
@@ -916,9 +921,29 @@ class JevActiveReply(Star):
             return await send_operation(original_send, (chain, *args), kwargs)
 
         async def native_send(operation, *args, _jev_action=None, **kwargs):
-            return await send_operation(
-                operation, args, kwargs, native=True, action=_jev_action
-            )
+            meta = event.get_extra(MARK)
+            try:
+                if (
+                    nested.get() is not asyncio.current_task()
+                    and not self._must_reply(event)
+                    and not meta.get("rejected")
+                    and not (meta.get("reviewed") and meta.get("output_ready"))
+                ):
+                    # Decline only the premature tool send, not the generation.
+                    raise DeliveryDeclined("unapproved_output_suppressed")
+                return await send_operation(
+                    operation, args, kwargs, native=True, action=_jev_action
+                )
+            except DeliveryDeclined as exc:
+                self._note(event, str(exc))
+                if not (
+                    meta.get("finished") or meta.get("rejected") or self._blocked(event)
+                ):
+                    meta["required_delivery"] = True
+                    event.set_extra(
+                        "_jev_complete_output", lambda: self._complete_output(event)
+                    )
+                return QueuedDelivery(_jev_action, (), {}, status="cancelled")
 
         event.send = send
         if getattr(event, "bot", None) is not None:
@@ -1115,15 +1140,13 @@ class JevActiveReply(Star):
             or event.get_extra("_jev_recall_notice")
         ):
             return
-        allow = self._cfg("enabled_sessions", [])
-        if not any(value in allow for value in ("*", *self._session_targets(event))):
+        if not self._enabled(event):
+            self._note(event, "outside_group_scope")
             return
         room = self.rooms.get(event.unified_msg_origin)
         settings = self.context.get_config(umo=event.unified_msg_origin)
         # Core resolves command filters before running message handlers.
-        if (
-            event.is_private_chat() or self._cfg("takeover_wake_messages", False)
-        ) and event.get_extra("handlers_parsed_params"):
+        if (self._takes_wakes(event)) and event.get_extra("handlers_parsed_params"):
             event.set_extra("_jev_command_owned", True)
             return
         action, reason = input_decision(
@@ -1158,6 +1181,7 @@ class JevActiveReply(Star):
             event.set_extra("_jev_command_owned", True)
             return
         if action == "skip" and not event.is_at_or_wake_command:
+            self._note(event, reason)
             return
         if action in ("pass", "skip") and event.is_at_or_wake_command:
             action, reason = "direct", "native_explicit_wake"
@@ -1197,6 +1221,7 @@ class JevActiveReply(Star):
             cooldown = max(0, min(10, float(self._cfg("direct_wake_interval", 0.5))))
             if (
                 not self._takes_wakes(event)
+                and reason not in {"explicit_at", "reply_to_bot"}
                 and not guard_exempt(event, self.config)
                 and now - room.direct_wakes.get(sender, -1e12) < cooldown
             ):
@@ -1220,7 +1245,9 @@ class JevActiveReply(Star):
 
     def _takes_wakes(self, event):
         return self._enabled(event) and (
-            event.is_private_chat() or self._cfg("takeover_wake_messages", False)
+            event.is_private_chat()
+            or self._cfg("takeover_wake_messages", False)
+            or direct_whitelist(event, self.config)
         )
 
     # Decide before the native tail; only an admitted turn may re-arm that tail.
@@ -1244,10 +1271,7 @@ class JevActiveReply(Star):
             and not getattr(event, "_has_send_oper", False)
             and (
                 event.is_private_chat()
-                or (
-                    self._cfg("takeover_wake_messages", False)
-                    and event.is_at_or_wake_command
-                )
+                or (self._takes_wakes(event) and event.is_at_or_wake_command)
             )
         )
         if event.get_extra(MARK):
@@ -1274,10 +1298,12 @@ class JevActiveReply(Star):
             await self._on_message(event)
         except asyncio.CancelledError:
             event.set_extra("_jev_admission_cancelled", True)
+            self._note(event, "admission_cancelled")
             raise
         except Exception:
             if not owned:
-                raise
+                self._note(event, "internal_error")
+                return
             event.set_extra("_jev_admission_failed", True)
             self._note(event, "admission_failed")
         finally:
@@ -1317,6 +1343,7 @@ class JevActiveReply(Star):
             or self._blocked(event)
             or event.get_extra("_jev_recall_notice")
         ):
+            self._note(event, "admission_disabled_or_cancelled")
             return
         if event.get_extra("_jev_input_action") in (
             "skip",
@@ -1333,6 +1360,7 @@ class JevActiveReply(Star):
         for old in list(self.pending_events.values()):
             await self._finish_expired(old, "expired_request")
         if str(event.get_sender_id()) == str(event.get_self_id()):
+            self._note(event, "self_message")
             return
         room = self.rooms.get(event.unified_msg_origin)
         if room is None:
@@ -1341,6 +1369,7 @@ class JevActiveReply(Star):
         if not self._cfg("dry_run", False):
             await self._load_quiet(event, room)
         if self._quiet(event, room):
+            self._note(event, "quiet_before_admission")
             return
         target = self._outline(event)
         reason = local_prefilter(event, self.config)
@@ -1364,7 +1393,7 @@ class JevActiveReply(Star):
         if not room.observe(row, message_id):
             if event.get_extra("_jev_takeover"):
                 event.set_extra("_jev_admission_duplicate", True)
-                self._note(event, "duplicate_ingress")
+            self._note(event, "duplicate_ingress")
             return
         generation = room.generation
         if event.get_extra("_gemini_stt_cache_only"):
@@ -1380,6 +1409,7 @@ class JevActiveReply(Star):
         ):
             return
         if str(event.get_sender_id()) in self._cfg("other_bot_ids", []):
+            self._note(event, "other_bot_message")
             return
         if not event.get_extra("_jev_takeover") and any(
             type(p).__name__ == "Reply"
@@ -1399,6 +1429,7 @@ class JevActiveReply(Star):
             and not target["actual_media"]
             and not self._must_reply(event)
         ):
+            self._note(event, "empty_message")
             return
         if (
             not event.get_extra("_jev_takeover")
@@ -1432,6 +1463,7 @@ class JevActiveReply(Star):
                 event.set_extra("_jev_context_unavailable", True)
                 return
             if self._blocked(event):
+                self._note(event, "admission_cancelled_after_context_read")
                 return
             if room.cid == cid:
                 reason = local_prefilter(
@@ -1447,6 +1479,7 @@ class JevActiveReply(Star):
             self._coalesce(event, room, cid)
         required = self._must_reply(event)
         if (not required and generation != room.generation) or self._blocked(event):
+            self._note(event, "candidate_superseded_or_cancelled")
             return
         target = self._outline(event)
         task = asyncio.current_task()
@@ -1468,16 +1501,8 @@ class JevActiveReply(Star):
                 if remaining <= 0:
                     self._note(event, "candidate_wait_expired")
                     if required:
-                        # Close admission before transport, including lost receipts.
                         burst.close(event)
                         event.stop_event()
-                        await self._send_audited(
-                            event,
-                            event.send,
-                            (event.plain_result(silence.FALLBACK_REPLY),),
-                            {},
-                        )
-                        self._note(event, "candidate_timeout_replied")
                     return
                 signal = room.changed
                 try:
@@ -1487,6 +1512,7 @@ class JevActiveReply(Star):
                         self._note(event, "candidate_wait_expired")
                         return
             if (not required and generation != room.generation) or self._blocked(event):
+                self._note(event, "candidate_superseded_or_cancelled")
                 return
             await self._evaluate(event, room, target, generation)
         except asyncio.CancelledError:
@@ -1508,6 +1534,7 @@ class JevActiveReply(Star):
             self._note(event, "delivery_backoff")
             return
         if room.busy(now):
+            self._note(event, "room_busy")
             return
         pacing = (
             0
@@ -1529,6 +1556,7 @@ class JevActiveReply(Star):
                 or self._blocked(event)
                 or room.busy(time.monotonic())
             ):
+                self._note(event, "evaluation_superseded_or_busy")
                 return
             now = time.monotonic()
         interval = (
@@ -1540,6 +1568,7 @@ class JevActiveReply(Star):
         if delay and not required:
             await asyncio.sleep(delay)
             if generation != room.generation or self._blocked(event):
+                self._note(event, "evaluation_cancelled_after_delay")
                 return
         umo = event.unified_msg_origin
         evaluation_kind = (
@@ -1562,6 +1591,7 @@ class JevActiveReply(Star):
             or self._blocked(event)
             or room.busy(time.monotonic())
         ):
+            self._note(event, "evaluation_superseded_or_busy")
             return
         room.claim(ticket, now)
         room.evaluated_at = now
@@ -1610,6 +1640,7 @@ class JevActiveReply(Star):
                 state["activity"]["last_delivered_reply"] = ""
                 state["activity"]["last_reply_to"] = ""
             if (not required and generation != room.generation) or self._blocked(event):
+                self._note(event, "evaluation_cancelled_after_snapshot")
                 return
             try:
                 await self.ledger.abump(umo, evaluation_kind)
@@ -1624,7 +1655,7 @@ class JevActiveReply(Star):
             )
             recent = sum(now - t < 120 for t in room.sent_times)
             decision_started = time.monotonic()
-            if not snapshot_ready:
+            if required or not snapshot_ready:
                 response = {}
                 verdict = Verdict(True, "respond", "explicit_reply_required")
             elif (
@@ -1892,6 +1923,9 @@ class JevActiveReply(Star):
         meta["completing"] = True
         try:
             await self._wait_delivery(meta)
+            if expired:
+                self._reject(event, None, "request_timeout")
+                return
             if self._must_reply(event) and not meta.get("rejected"):
                 # A plugin stopping propagation is not a user recall. Preserve
                 # explicit cancellation flags, but finish an otherwise owed reply.
@@ -1899,8 +1933,6 @@ class JevActiveReply(Star):
                 if event.get_extra("_jev_context_unavailable"):
                     await self._context_failure_reply(event)
                     return
-                if expired:
-                    meta["created"] = time.monotonic()
                 flush = event.get_extra("_jev_flush_output")
                 if not self._blocked(event):
                     result = event.get_result()
@@ -2605,8 +2637,7 @@ class JevActiveReply(Star):
         ):
             yield event.plain_result("当前未启用 Jev 管理功能。")
             return
-        allow = self._cfg("enabled_sessions", [])
-        if not any(x in allow for x in ("*", *self._session_targets(event))):
+        if not self._in_scope(event):
             yield event.plain_result("当前会话不在插件接管范围内。")
             return
         room = self.rooms.get(event.unified_msg_origin)
@@ -2658,7 +2689,7 @@ class JevActiveReply(Star):
             await asyncio.shield(self.audit_task)
         pools = [pool.status() for pool in self.client.pools.values()]
         lines = [
-            "Jev 主动回复插件 0.10.3 · 木有知",
+            "Jev 主动回复插件 0.10.4 · 木有知",
             f"当前会话：{'已启用' if self._enabled(event) else '未启用'}",
         ]
         names = {

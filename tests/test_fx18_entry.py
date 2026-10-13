@@ -57,7 +57,7 @@ async def test_online_lifecycle_one_platform_send(env, monkeypatch, kind, mode):
         await pipeline(env, event, "[PASS]。", adapter=True)
     else:
         if mode == "history_advance":
-            evaluator = env.plugin.client.evaluate
+            evaluator = bridge.build_snapshot
 
             async def advanced(*args):
                 result = await evaluator(*args)
@@ -65,7 +65,7 @@ async def test_online_lifecycle_one_platform_send(env, monkeypatch, kind, mode):
                 env.plugin.rooms.get(event.unified_msg_origin).generation += 1
                 return result
 
-            env.plugin.client.evaluate = advanced
+            monkeypatch.setattr(bridge, "build_snapshot", advanced)
         entered, release = asyncio.Event(), asyncio.Event()
         task = asyncio.create_task(
             pipeline(
@@ -94,6 +94,10 @@ async def test_online_lifecycle_one_platform_send(env, monkeypatch, kind, mode):
         finally:
             release.set()
             await task
+    if mode in {"wait", "lease"}:
+        bot.transport.assert_not_awaited()
+        assert not env.plugin.rooms.get(event.unified_msg_origin).pending
+        return
     body = delivered(bot)
     meta = event.get_extra(MARK)
     assert meta is None or meta.get("sent_parts", 0) == 1

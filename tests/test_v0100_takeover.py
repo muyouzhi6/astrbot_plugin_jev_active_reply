@@ -1,7 +1,6 @@
 """Wake/private ownership against real Core stages; synthetic messages only."""
 
 import asyncio
-from copy import deepcopy
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock, Mock
 
@@ -119,7 +118,7 @@ async def test_takeover_admits_one_native_generation(env, kind):
     await pipeline(env, ev, sent)
     assert sent == [ev]
     assert ev.get_extra(MARK) and ev.get_extra("_jev_takeover")
-    env.plugin.client.evaluate.assert_awaited_once()
+    env.plugin.client.evaluate.assert_not_awaited()
     assert env.plugin.metrics.replies == 1
     assert await env.plugin.ledger.acount(ev.unified_msg_origin, "sent") == 1
 
@@ -147,7 +146,7 @@ async def test_explicit_wake_replies_once_despite_silence_or_judge_failure(
     assert ev.get_result().get_plain_text() == "这是合成的回复"
     assert ev.get_extra(MARK)["committed"] and ev.get_extra("_jev_takeover")
     assert ev.get_extra("_test_generation_request").func_tool.names() == ["web_search"]
-    env.plugin.client.evaluate.assert_awaited_once()
+    env.plugin.client.evaluate.assert_not_awaited()
     assert env.plugin.metrics.replies == 1
     assert await env.plugin.ledger.acount(ev.unified_msg_origin, "sent") == 1
 
@@ -155,7 +154,9 @@ async def test_explicit_wake_replies_once_despite_silence_or_judge_failure(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["at", "prefix", "private"])
 @pytest.mark.parametrize("phase", ["judge", "generate"])
-async def test_concurrent_burst_replaces_old_turn_and_delivers_once(env, kind, phase):
+async def test_concurrent_burst_replaces_old_turn_and_delivers_once(
+    env, monkeypatch, kind, phase
+):
     env.cfg.update(
         takeover_wake_messages=True,
         enable_private_chat=True,
@@ -163,15 +164,17 @@ async def test_concurrent_burst_replaces_old_turn_and_delivers_once(env, kind, p
         evaluation_interval=1,
     )
     entered, release = asyncio.Event(), asyncio.Event()
-    original = deepcopy(env.response)
+    from .. import bridge
+
+    original = bridge.build_snapshot
 
     async def judge(*args):
         if not entered.is_set() and phase == "judge":
             entered.set()
             await release.wait()
-        return original
+        return await original(*args)
 
-    env.plugin.client.evaluate.side_effect = judge
+    monkeypatch.setattr(bridge, "build_snapshot", judge)
     one = incoming(kind, "first", "看看模型上下文")
     two = incoming(kind, "second", "补充模型上下文的问题")
     sent = []
@@ -206,7 +209,7 @@ async def test_private_allow_and_deny_scope(env, scope):
     env.cfg["disabled_sessions"] = ["human"] if scope == "denied" else []
     sent = []
     await pipeline(env, ev, sent)
-    assert bool(ev.get_extra(MARK)) == (scope not in {"missing", "denied"})
+    assert bool(ev.get_extra(MARK)) == (scope != "denied")
     assert sent == [ev]
     if scope in {"missing", "denied"}:
         env.plugin.client.evaluate.assert_not_awaited()
@@ -302,7 +305,7 @@ async def test_reentry_does_not_clear_an_admitted_wake(env):
     ticket = ev.get_extra(MARK)["ticket"]
     await env.plugin.on_message(ev)
     assert ev.is_at_or_wake_command and ev.get_extra(MARK)["ticket"] == ticket
-    env.plugin.client.evaluate.assert_awaited_once()
+    env.plugin.client.evaluate.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -447,7 +450,8 @@ async def test_takeover_snapshot_and_native_request_preserve_persona(env, kind):
     ev = incoming(kind)
     await env.plugin.on_input(ev)
     await env.plugin.on_message(ev)
-    state = env.plugin.client.evaluate.await_args.args[0]
+    state = ev.get_extra(MARK)["state"]
+    env.plugin.client.evaluate.assert_not_awaited()
     assert state["activity"]["interaction"] == (
         "private_chat" if kind == "private" else "explicit_wake"
     )

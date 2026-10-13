@@ -43,19 +43,19 @@ async def test_candidate_timeout_has_single_transport_terminal(
     # Completion may be invoked again by Core even after admission unwinds.
     await env.plugin._context_failure_reply(event)
     records = [(reason, data) for _, reason, data in env.plugin.audit_queue]
-    assert bot.transport.await_count == 1
-    assert event.get_extra("_jev_send_sequence") == 1
+    assert bot.transport.await_count == 0
+    assert not event.get_extra("_jev_send_sequence")
     assert event.is_stopped()
     assert not event.get_extra("_jev_candidate_running")
     assert not env.plugin.rooms.get(event.unified_msg_origin).pending
     attempts = [
         data["send_sequence"] for reason, data in records if reason == "send_attempt"
     ]
-    assert attempts == [1]
+    assert attempts == []
     terminal = "send_completed" if failure == "success" else "send_failed"
-    assert sum(reason == terminal for reason, _ in records) == 1
+    assert sum(reason == terminal for reason, _ in records) == 0
     if failure == "lost_receipt":
-        assert len(accepted) == 1
+        assert len(accepted) == 0
     assert "[PASS]" not in str(bot.transport.await_args_list)
 
 

@@ -43,11 +43,11 @@ async def test_storage_failure_reply(env, monkeypatch, kind, failure):
         if writer:
             writer.rollback()
             writer.close()
-    assert bot.transport.await_count == 1, payload(bot)
+    assert bot.transport.await_count == (0 if failure == "entry" else 1), payload(bot)
     assert len(responses) <= 1
     assert not env.plugin.rooms.get(event.unified_msg_origin).pending
     await env.plugin._context_failure_reply(event)
-    assert bot.transport.await_count == 1
+    assert bot.transport.await_count == (0 if failure == "entry" else 1)
 
 
 @pytest.mark.asyncio

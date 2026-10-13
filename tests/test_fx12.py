@@ -133,7 +133,7 @@ async def test_lifecycle_independent(env, monkeypatch, kind, mode):
         await pipeline(env, event, "[不回复]", adapter=True)
     else:
         if mode == "superseded":
-            original = env.plugin.client.evaluate
+            original = bridge.build_snapshot
 
             async def evaluate(*args):
                 value = await original(*args)
@@ -141,7 +141,7 @@ async def test_lifecycle_independent(env, monkeypatch, kind, mode):
                 monkeypatch.setattr(bridge, "fingerprint", lambda conv: "new-history")
                 return value
 
-            env.plugin.client.evaluate = evaluate
+            monkeypatch.setattr(bridge, "build_snapshot", evaluate)
         entered, release = asyncio.Event(), asyncio.Event()
         task = asyncio.create_task(
             pipeline(
@@ -170,7 +170,7 @@ async def test_lifecycle_independent(env, monkeypatch, kind, mode):
             release.set()
             await task
     encoded = payload(bot)
-    assert bot.transport.await_count == 1, encoded
+    assert bot.transport.await_count == (0 if mode in {"wait", "lease"} else 1), encoded
     assert "[PASS]" not in encoded and "[不回复]" not in encoded
     assert not env.plugin.rooms.get(event.unified_msg_origin).pending
 

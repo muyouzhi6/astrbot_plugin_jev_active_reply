@@ -112,6 +112,19 @@ def migrate_groups(raw):
 
 RELAY_MODES = ("typesafe", "nanbei", "custom")
 RELAY_CONFIG_VERSION = 1
+DEFAULT_SCOPE_GROUPS = ["215532038", "1108263703", "741379052"]
+
+
+def migrate_scope(raw):
+    if "scope_groups" in raw or "enabled_sessions" not in raw:
+        return False
+    raw["scope_groups"] = [
+        str(value)
+        for value in raw["enabled_sessions"]
+        if ":FriendMessage:" not in str(value)
+    ]
+    raw.setdefault("group_scope_mode", "whitelist")
+    return True
 
 
 def migrate_relay(raw):
@@ -161,7 +174,8 @@ def migrate_config_file(path):
         return
     original = path.read_bytes()
     raw = json.loads(original.decode("utf-8-sig"))
-    changed = migrate_groups(raw)
+    changed = migrate_scope(raw)
+    changed = migrate_groups(raw) or changed
     if not migrate_relay(raw) and not changed:
         return
     backup = path.with_name(
@@ -173,7 +187,9 @@ def migrate_config_file(path):
         handle.write(original)
     descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=".jev-migrate-")
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        encoding = "utf-8-sig" if original.startswith(b"\xef\xbb\xbf") else "utf-8"
+        newline = "\r\n" if b"\r\n" in original else "\n"
+        with os.fdopen(descriptor, "w", encoding=encoding, newline=newline) as handle:
             json.dump(raw, handle, ensure_ascii=False, indent=2)
             handle.flush()
             os.fsync(handle.fileno())
@@ -189,7 +205,7 @@ class ConfigView(MutableMapping):
     def __init__(self, raw):
         self.raw = raw
         advanced = raw.get("advanced")
-        changed = False
+        changed = migrate_scope(raw)
         changed = migrate_relay(raw) or changed
         for obsolete in ("mindshub", "mindshub_air"):
             if obsolete in raw:

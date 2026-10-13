@@ -166,7 +166,7 @@ async def test_online_required_lifecycle(env, monkeypatch, kind, mode):
         await pipeline(env, event, "[PASS]。", adapter=True)
     else:
         if mode == "superseded":
-            original = env.plugin.client.evaluate
+            original = bridge.build_snapshot
 
             async def evaluate(*args):
                 result = await original(*args)
@@ -174,7 +174,7 @@ async def test_online_required_lifecycle(env, monkeypatch, kind, mode):
                 env.plugin.rooms.get(event.unified_msg_origin).generation += 1
                 return result
 
-            env.plugin.client.evaluate = evaluate
+            monkeypatch.setattr(bridge, "build_snapshot", evaluate)
         entered, release = asyncio.Event(), asyncio.Event()
         task = asyncio.create_task(
             pipeline(
@@ -203,6 +203,10 @@ async def test_online_required_lifecycle(env, monkeypatch, kind, mode):
         finally:
             release.set()
             await task
+    if mode in {"wait", "lease"}:
+        bot.transport.assert_not_awaited()
+        assert not env.plugin.rooms.get(event.unified_msg_origin).pending
+        return
     body = platform_payload(bot)
     assert body and not env.plugin.rooms.get(event.unified_msg_origin).pending
     if mode == "external_stop":

@@ -155,7 +155,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_self_and_unapproved_skipped(self):
         await self.plugin.on_message(event(sender="bot"))
-        self.cfg["enabled_sessions"] = []
+        self.cfg["scope_groups"] = []
         await self.plugin.on_message(event(mid="2"))
         self.plugin.client.evaluate.assert_not_called()
 
