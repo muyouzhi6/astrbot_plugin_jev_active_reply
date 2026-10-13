@@ -203,10 +203,6 @@ async def test_online_required_lifecycle(env, monkeypatch, kind, mode):
         finally:
             release.set()
             await task
-    if mode in {"wait", "lease"}:
-        bot.transport.assert_not_awaited()
-        assert not env.plugin.rooms.get(event.unified_msg_origin).pending
-        return
     body = platform_payload(bot)
     assert body and not env.plugin.rooms.get(event.unified_msg_origin).pending
     if mode == "external_stop":

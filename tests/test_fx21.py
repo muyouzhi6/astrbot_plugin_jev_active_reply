@@ -176,10 +176,6 @@ async def test_online_wake_miss_modes_have_one_terminal_send(
             release.set()
             await asyncio.wait_for(task, 4)
 
-    if mode in {"candidate_timeout", "lease_expired"}:
-        bot.transport.assert_not_awaited()
-        assert not env.plugin.rooms.get(event.unified_msg_origin).pending
-        return
     body = platform_payload(bot)
     assert '"type": "image"' in body if mode == "external_media_stop" else body
     assert silence.FALLBACK_REPLY in body or '"type": "image"' in body

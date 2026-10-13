@@ -21,6 +21,14 @@ async def test_candidate_timeout_has_single_transport_terminal(
     monkeypatch.setattr(bridge, "native_busy", lambda ev: True)
     monkeypatch.setattr(env.plugin, "_lifetime", lambda: 0.01)
     accepted = []
+    records = []
+    original_note = env.plugin._note
+
+    def note(ev, reason, details=None):
+        records.append((reason, details or {}))
+        return original_note(ev, reason, details)
+
+    monkeypatch.setattr(env.plugin, "_note", note)
 
     async def transport(*args, **kwargs):
         if failure == "lost_receipt":
@@ -42,20 +50,25 @@ async def test_candidate_timeout_has_single_transport_terminal(
         pass
     # Completion may be invoked again by Core even after admission unwinds.
     await env.plugin._context_failure_reply(event)
-    records = [(reason, data) for _, reason, data in env.plugin.audit_queue]
-    assert bot.transport.await_count == 0
-    assert not event.get_extra("_jev_send_sequence")
+    assert bot.transport.await_count == 1
+    assert event.get_extra("_jev_send_sequence") == 1
+    assert event.get_extra("_jev_delivery_state") == (
+        "completed" if failure == "success" else "uncertain"
+    )
     assert event.is_stopped()
     assert not event.get_extra("_jev_candidate_running")
     assert not env.plugin.rooms.get(event.unified_msg_origin).pending
     attempts = [
         data["send_sequence"] for reason, data in records if reason == "send_attempt"
     ]
-    assert attempts == []
+    assert attempts == [1]
     terminal = "send_completed" if failure == "success" else "send_failed"
-    assert sum(reason == terminal for reason, _ in records) == 0
+    assert sum(reason == terminal for reason, _ in records) == 1
     if failure == "lost_receipt":
-        assert len(accepted) == 0
+        assert len(accepted) == 1
+    if failure == "success":
+        assert sum(reason == "adapter_send_completed" for reason, _ in records) == 1
+        assert not event.get_extra("_jev_admission_failed")
     assert "[PASS]" not in str(bot.transport.await_args_list)
 
 

@@ -130,9 +130,7 @@ async def test_online_lifecycle(env, monkeypatch, kind, mode):
             await asyncio.sleep(0.05)
         release.set()
         await task
-    assert bot.transport.await_count == (0 if mode in {"wait", "lease"} else 1), (
-        payload(bot)
-    )
+    assert bot.transport.await_count == 1, payload(bot)
     assert "[PASS]" not in payload(bot)
     assert not env.plugin.rooms.get(event.unified_msg_origin).pending
 

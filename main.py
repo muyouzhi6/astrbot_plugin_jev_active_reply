@@ -47,6 +47,7 @@ from .delivery import (
     native_delivery,
     SplitAdapters,
     install_completion_adapter,
+    install_native_reply_guard,
     install_send_tool_adapter,
     plan_onebot,
 )
@@ -515,8 +516,9 @@ class JevActiveReply(Star):
         if not (
             event.get_extra("_jev_context_unavailable")
             or event.get_extra("_jev_admission_failed")
-        ):
+        ) or event.get_extra("_jev_context_failure_done"):
             return
+        event.set_extra("_jev_context_failure_done", True)
         meta = event.get_extra(MARK, {})
         if meta:
             await self._wait_delivery(meta)
@@ -1190,6 +1192,8 @@ class JevActiveReply(Star):
             if action == "direct":
                 event.is_at_or_wake_command = True
                 event.set_extra("_jev_direct_wake", reason)
+                if not self._takes_wakes(event):
+                    install_native_reply_guard(event)
             elif action == "quiet":
                 event.stop_event()
             return
@@ -1238,6 +1242,8 @@ class JevActiveReply(Star):
             room.direct_wakes[sender] = now
             event.is_at_or_wake_command = True
             event.set_extra("_jev_direct_wake", reason)
+            if not self._takes_wakes(event):
+                install_native_reply_guard(event)
             self._note(event, reason)
         elif sender in room.quiet_senders and not guard_exempt(event, self.config):
             event.stop_event()
@@ -1310,6 +1316,7 @@ class JevActiveReply(Star):
             if not event.get_extra(MARK) and not (
                 event.get_extra("_jev_admission_duplicate")
                 or event.get_extra("_jev_admission_cancelled")
+                or event.get_extra("_jev_wait_finished")
             ):
                 if event.get_extra("_jev_takeover"):
                     event.set_extra("_jev_admission_failed", True)
@@ -1501,8 +1508,7 @@ class JevActiveReply(Star):
                 if remaining <= 0:
                     self._note(event, "candidate_wait_expired")
                     if required:
-                        burst.close(event)
-                        event.stop_event()
+                        await self._finish_waiting_request(event, room, cid)
                     return
                 signal = room.changed
                 try:
@@ -1526,6 +1532,40 @@ class JevActiveReply(Star):
         finally:
             event.set_extra("_jev_candidate_running", False)
             self.tasks.discard(task)
+
+    async def _finish_waiting_request(self, event, room, cid):
+        # No lease was claimed yet; do not release another request's room ticket.
+        if event.get_extra("_jev_wait_finished"):
+            return
+        event.set_extra("_jev_wait_finished", True)
+        try:
+            fresh_cid, _ = await self._read_conversation(event)
+            if (
+                self.closed
+                or self._blocked(event)
+                or self._quiet(event, room)
+                or fresh_cid != cid
+            ):
+                self._note(event, "candidate_reply_cancelled")
+                return
+            await self._send_audited(
+                event,
+                event.send,
+                (event.plain_result(silence.FALLBACK_REPLY),),
+                {},
+            )
+            frame = event.get_extra(burst.FRAME)
+            if frame:
+                frame.committed = True
+            try:
+                await self.ledger.abump(event.unified_msg_origin, "sent")
+            except Exception:
+                self._note(event, "delivery_counter_unavailable")
+            self._note(event, "adapter_send_completed")
+            self._note(event, "candidate_timeout_completed")
+        finally:
+            burst.close(event)
+            event.stop_event()
 
     async def _evaluate(self, event, room, target, generation):
         now = time.monotonic()
@@ -1924,8 +1964,7 @@ class JevActiveReply(Star):
         try:
             await self._wait_delivery(meta)
             if expired:
-                self._reject(event, None, "request_timeout")
-                return
+                self._note(event, "request_lease_expired")
             if self._must_reply(event) and not meta.get("rejected"):
                 # A plugin stopping propagation is not a user recall. Preserve
                 # explicit cancellation flags, but finish an otherwise owed reply.
@@ -1952,8 +1991,18 @@ class JevActiveReply(Star):
                         event.set_result(event.chain_result([]))
                 if flush and not self._blocked(event):
                     await flush()
+            state = event.get_extra("_jev_delivery_state")
             self._note(
-                event, "request_timeout_completed" if expired else "output_completed"
+                event,
+                (
+                    "request_timeout_completed"
+                    if state == "completed"
+                    else "request_timeout_cancelled"
+                    if state != "uncertain"
+                    else "request_timeout_uncertain"
+                )
+                if expired
+                else "output_completed",
             )
         except Exception as exc:
             state = event.get_extra("_jev_delivery_state", "queued")
@@ -2200,6 +2249,13 @@ class JevActiveReply(Star):
         text = str(response.completion_text or "").strip()
         meta = event.get_extra(MARK)
         if not meta:
+            native_sent = event.get_extra("_jev_native_reply_guard")
+            if native_sent is not None and not self._blocked(event):
+                silence.repair_required_reply(
+                    response=response, fallback=not native_sent()
+                )
+                event.set_extra("_llm_reasoning_content", response.reasoning_content)
+                text = str(response.completion_text or "").strip()
             if (
                 self._in_scope(event)
                 and text
@@ -2207,6 +2263,10 @@ class JevActiveReply(Star):
                 and not self._blocked(event)
             ):
                 event.set_extra(NORMAL, text)
+            return
+        if meta.get("finished"):
+            silence.clear_output(event, response)
+            self._note(event, "late_output_suppressed")
             return
         if self._must_reply(event) and not meta.get("rejected"):
             self._resume_required(event)

@@ -98,10 +98,6 @@ async def test_online_miss_modes_close_once(env, monkeypatch, kind, mode):
         finally:
             release.set()
             await task
-    if mode in {"candidate_timeout", "lease_timeout"}:
-        bot.transport.assert_not_awaited()
-        assert not env.plugin.rooms.get(event.unified_msg_origin).pending
-        return
     value = platform_payload(bot)
     assert '"type": "image"' in value if mode == "external_media_stop" else value
     assert event.get_extra("_jev_send_sequence") == 1

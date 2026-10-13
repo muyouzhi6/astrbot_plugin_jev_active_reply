@@ -213,9 +213,7 @@ async def test_whitelist_does_not_override_ignored_user(env):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "failure", ["context", "admission", "capacity", "generation", "timeout"]
-)
+@pytest.mark.parametrize("failure", ["context", "admission", "capacity", "generation"])
 async def test_internal_failure_is_silent_and_info_logged(env, monkeypatch, failure):
     wake.configure(env)
     event, bot = adapter_event("at")
@@ -233,9 +231,6 @@ async def test_internal_failure_is_silent_and_info_logged(env, monkeypatch, fail
         )
     elif failure == "capacity":
         monkeypatch.setattr(env.plugin.rooms, "get", lambda _: None)
-    elif failure == "timeout":
-        monkeypatch.setattr(bridge, "native_busy", lambda _: True)
-        monkeypatch.setattr(env.plugin, "_lifetime", lambda: 0.01)
     if failure == "generation":
         await env.plugin.on_input(event)
         await env.plugin.on_message(event)
@@ -255,6 +250,24 @@ async def test_internal_failure_is_silent_and_info_logged(env, monkeypatch, fail
         for line in logs
     )
     assert all("private error" not in line for line in logs)
+
+
+@pytest.mark.asyncio
+async def test_required_timeout_has_normal_reply_not_error_prompt(env, monkeypatch):
+    wake.configure(env)
+    event, bot = adapter_event("at")
+    info = Mock()
+    monkeypatch.setattr(main.logger, "info", info)
+    monkeypatch.setattr(bridge, "native_busy", lambda _: True)
+    monkeypatch.setattr(env.plugin, "_lifetime", lambda: 0.01)
+
+    await pipeline(env, event, adapter=True)
+
+    payload = platform_payload(bot)
+    assert silence.FALLBACK_REPLY in payload
+    assert "失败" not in payload and "超时" not in payload
+    assert event.get_extra("_jev_delivery_state") == "completed"
+    assert any(args[1] == "candidate_wait_expired" for args, _ in info.call_args_list)
 
 
 @pytest.mark.asyncio

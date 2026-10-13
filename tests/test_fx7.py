@@ -153,6 +153,6 @@ async def test_online_lifecycle(env, monkeypatch, kind, mode):
             if not task.done():
                 task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-    assert bot.transport.await_count == (0 if mode in {"wait", "lease"} else 1)
+    assert bot.transport.await_count == 1
     assert "[PASS]" not in str(bot.transport.await_args_list)
     assert not env.plugin.rooms.get(event.unified_msg_origin).pending

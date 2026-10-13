@@ -166,13 +166,6 @@ async def test_completion_waits_for_transport(env, monkeypatch, expired, fail):
         finishing = asyncio.create_task(
             env.plugin._complete_output(event, expired=expired)
         )
-        if expired:
-            await finishing
-            assert bot.transport.await_count == 0
-            assert sending.result().status == "cancelled"
-            assert event.get_extra(MARK)["finished"]
-            assert not env.plugin.rooms.get(event.unified_msg_origin).pending
-            return
         await asyncio.wait_for(entered.wait(), 3)
         await asyncio.sleep(0.02)
         assert not finishing.done()
@@ -185,6 +178,8 @@ async def test_completion_waits_for_transport(env, monkeypatch, expired, fail):
         assert event.get_extra(MARK)["finished"]
         assert bool(event.get_extra(MARK).get("sent_parts")) == (not fail)
         assert ("send_failed" in reasons) == fail
+        if expired:
+            assert "request_lease_expired" in reasons
         assert not env.plugin.rooms.get(event.unified_msg_origin).pending
     finally:
         release.set()

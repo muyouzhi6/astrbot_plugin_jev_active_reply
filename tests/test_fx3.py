@@ -94,6 +94,6 @@ async def test_production_failure_lifecycle(env, monkeypatch, mode):
         await asyncio.sleep(0.05)
     release.set()
     await task
-    assert bot.transport.await_count == (0 if mode == "lease" else 1), payload(bot)
+    assert bot.transport.await_count == 1, payload(bot)
     assert event.get_extra(MARK)["finished"]
     assert not env.plugin.rooms.get(event.unified_msg_origin).pending

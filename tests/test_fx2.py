@@ -42,14 +42,17 @@ async def test_late_consumed_and_split_marker(env, native, texts):
 
 
 @pytest.mark.asyncio
-async def test_candidate_timeout_is_silent(env, monkeypatch):
+async def test_candidate_timeout_has_required_terminal_reply(env, monkeypatch):
     wake.configure(env)
     event, bot = adapter_event("at")
     monkeypatch.setattr(bridge, "native_busy", lambda ev: True)
     monkeypatch.setattr(env.plugin, "_lifetime", lambda: 0.02)
     await env.plugin.on_input(event)
     await env.plugin.on_message(event)
-    assert bot.transport.await_count == 0
+    assert bot.transport.await_count == 1
+    assert "我在，请再说一下你的问题。" in json.dumps(
+        bot.transport.await_args.kwargs, ensure_ascii=False
+    )
     assert event.is_stopped()
 
 
@@ -70,17 +73,24 @@ async def test_stopped_generation_completes_once(env):
 
 
 @pytest.mark.asyncio
-async def test_lease_rejects_late_send(env):
+async def test_lease_rejects_late_send_but_preserves_buffered_body(env):
     wake.configure(env)
     wake.judge_result(env, "reply")
     event, bot = adapter_event("at")
     await env.plugin.on_input(event)
     await env.plugin.on_message(event)
+    queued = await event.bot.send_group_msg(
+        group_id=987654321, message="Buffered before lease expiry"
+    )
+    assert queued.status == "queued"
     env.plugin._expire(event)
     await asyncio.sleep(0.05)
     with pytest.raises(DeliveryDeclined):
         await event.send(event.plain_result("Late answer"))
-    assert bot.transport.await_count == 0
+    assert bot.transport.await_count == 1
+    assert "Buffered before lease expiry" in json.dumps(
+        bot.transport.await_args.kwargs, ensure_ascii=False
+    )
 
 
 @pytest.mark.asyncio
@@ -172,6 +182,6 @@ async def test_dispatched_terminal(env, mode):
     else:
         env.plugin._expire(event)
         await asyncio.sleep(0.05)
-    assert bot.transport.await_count == (0 if mode == "lease" else 1)
+    assert bot.transport.await_count == 1
     assert event.get_extra(MARK)["finished"]
     assert not env.plugin.rooms.get(event.unified_msg_origin).pending

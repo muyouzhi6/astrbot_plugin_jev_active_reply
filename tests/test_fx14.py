@@ -128,10 +128,7 @@ async def test_log_lifecycle_combinations(env, monkeypatch, kind, mode):
         finally:
             release.set()
             await task
-    if mode in {"wait", "lease"}:
-        bot.transport.assert_not_awaited()
-        assert not env.plugin.rooms.get(event.unified_msg_origin).pending
-        return
+    assert bot.transport.await_count == 1
     value = json.dumps(payload(bot), ensure_ascii=False)
     assert "[不回复]" not in value
     if mode == "multi":

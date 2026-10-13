@@ -170,7 +170,7 @@ async def test_lifecycle_independent(env, monkeypatch, kind, mode):
             release.set()
             await task
     encoded = payload(bot)
-    assert bot.transport.await_count == (0 if mode in {"wait", "lease"} else 1), encoded
+    assert bot.transport.await_count == 1, encoded
     assert "[PASS]" not in encoded and "[不回复]" not in encoded
     assert not env.plugin.rooms.get(event.unified_msg_origin).pending
 

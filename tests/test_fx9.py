@@ -10,6 +10,7 @@ from astrbot.core.star.star_handler import (
     star_handlers_registry,
 )
 
+from .. import silence
 from ..main import MARK
 from . import test_v0101_explicit_wake as wake
 from .test_v0102_wake_warnings import adapter_event, delivery_hooks, env, pipeline
@@ -72,7 +73,10 @@ async def test_deadline_before_timer_completes(env, entry):
         await env.plugin.on_input(other)
         await env.plugin.on_message(other)
     await env.plugin._complete_output(event, expired=True)
-    assert bot.transport.await_count == 0, payload(bot)
+    assert bot.transport.await_count == 1, payload(bot)
+    assert silence.FALLBACK_REPLY in payload(bot)
+    assert "[PASS]" not in payload(bot) and "[不回复]" not in payload(bot)
+    assert event.get_extra("_jev_delivery_state") == "completed"
     assert meta["finished"]
     assert not meta.get("lease")
 

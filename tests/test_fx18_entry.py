@@ -94,10 +94,6 @@ async def test_online_lifecycle_one_platform_send(env, monkeypatch, kind, mode):
         finally:
             release.set()
             await task
-    if mode in {"wait", "lease"}:
-        bot.transport.assert_not_awaited()
-        assert not env.plugin.rooms.get(event.unified_msg_origin).pending
-        return
     body = delivered(bot)
     meta = event.get_extra(MARK)
     assert meta is None or meta.get("sent_parts", 0) == 1

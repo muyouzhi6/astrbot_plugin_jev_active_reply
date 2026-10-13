@@ -144,6 +144,29 @@ def install_completion_adapter():
     RespondStage.process = respond
 
 
+def install_native_reply_guard(event):
+    """Clean a native wake's final sends without taking over its generation."""
+    if event.get_extra("_jev_native_reply_guard") is not None:
+        return
+    original_send = event.send
+    sent = False
+
+    async def send(chain, *args, **kwargs):
+        nonlocal sent
+        texts = [part.text for part in silence._plain_components(chain.chain)]
+        if silence.MARKER.search("".join(texts)):
+            chain = copy.deepcopy(chain)
+            silence.repair_required_reply(result=chain, fallback=not sent)
+            if not silence.has_reply_content(chain.chain):
+                return None
+        result = await original_send(chain, *args, **kwargs)
+        sent = True
+        return result
+
+    event.send = send
+    event.set_extra("_jev_native_reply_guard", lambda: sent)
+
+
 class DeliveryDeclined(Exception):
     pass
 
