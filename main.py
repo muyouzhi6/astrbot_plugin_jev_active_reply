@@ -1272,13 +1272,19 @@ class JevActiveReply(Star):
             event.is_at_or_wake_command = False
         try:
             await self._on_message(event)
+        except asyncio.CancelledError:
+            event.set_extra("_jev_admission_cancelled", True)
+            raise
         except Exception:
             if not owned:
                 raise
             event.set_extra("_jev_admission_failed", True)
             self._note(event, "admission_failed")
         finally:
-            if not event.get_extra(MARK):
+            if not event.get_extra(MARK) and not (
+                event.get_extra("_jev_admission_duplicate")
+                or event.get_extra("_jev_admission_cancelled")
+            ):
                 if event.get_extra("_jev_takeover"):
                     event.set_extra("_jev_admission_failed", True)
                 await self._context_failure_reply(event)
@@ -1356,6 +1362,9 @@ class JevActiveReply(Star):
             "reply_to": target["reply_to"],
         }
         if not room.observe(row, message_id):
+            if event.get_extra("_jev_takeover"):
+                event.set_extra("_jev_admission_duplicate", True)
+                self._note(event, "duplicate_ingress")
             return
         generation = room.generation
         if event.get_extra("_gemini_stt_cache_only"):
