@@ -194,6 +194,9 @@ class Ledger:
                 "sender_hash",
                 "send_sequence",
                 "receipt_id",
+                "wake_kind",
+                "sender_is_admin",
+                "delivery_state",
             )
         }
         if "trigger_preview" in allowed:

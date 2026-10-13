@@ -83,6 +83,7 @@ async def test_real_response_stop_hooks(env, monkeypatch, kind, output, priority
                 message=[{"type": "image", "data": {"file": "base64://c3ludGhldGlj"}}],
                 **target,
             )
+        ev.set_extra("agent_stop_requested", True)
         ev.stop_event()
 
     async def stop(ev, response):

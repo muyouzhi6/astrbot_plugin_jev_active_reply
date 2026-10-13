@@ -155,6 +155,17 @@ class JevActiveReply(Star):
 
     @staticmethod
     def _blocked(event):
+        meta = event.get_extra(MARK, {})
+        if meta.get("required_delivery") or (
+            not meta and event.get_extra("_jev_takeover")
+        ):
+            # External lifecycle stops cannot revoke an accepted required reply.
+            return bool(
+                meta.get("rejected")
+                or event.get_extra("_jev_admission_cancelled")
+                or event.get_extra(silence.SILENT)
+                or event.get_extra(silence.RECALL)
+            )
         return (
             event.is_stopped()
             or bool(event.get_extra("agent_stop_requested"))
@@ -180,6 +191,8 @@ class JevActiveReply(Star):
         )
 
     def _must_reply(self, event):
+        if event.get_extra(MARK, {}).get("required_delivery"):
+            return True
         if silence.must_reply(event, self._silence_settings()):
             return True
         if requires_reply(event, self.config):
@@ -300,7 +313,12 @@ class JevActiveReply(Star):
             **(details or {}),
             "ingress_id": scope_id(str(getattr(event.message_obj, "message_id", ""))),
             "sender_hash": scope_id(str(event.get_sender_id())),
+            "wake_kind": event.get_extra("_jev_direct_wake")
+            or ("private_chat" if event.is_private_chat() else "autonomous"),
+            "sender_is_admin": bool(event.is_admin()),
         }
+        if event.get_extra("_jev_turn_id"):
+            details["turn_id"] = event.get_extra("_jev_turn_id")
         if meta:
             details = {
                 **(details or {}),
@@ -629,19 +647,29 @@ class JevActiveReply(Star):
         sequence = event.get_extra("_jev_send_sequence", 0) + 1
         event.set_extra("_jev_send_sequence", sequence)
         event.set_extra("_jev_delivery_state", "started")
+        requests = event.get_extra("_jev_native_requests", [])
+        for request in requests:
+            request.status = "platform_started"
         details = {"send_sequence": sequence}
-        self._note(event, "send_attempt", details)
+        self._note(
+            event, "send_attempt", {**details, "delivery_state": "platform_started"}
+        )
         try:
             result = await operation(*args, **kwargs)
         except BaseException:
             event.set_extra("_jev_delivery_state", "uncertain")
-            self._note(event, "send_failed", details)
+            for request in requests:
+                request.status = "uncertain"
+            self._note(event, "send_failed", {**details, "delivery_state": "uncertain"})
             raise
         receipt = result.get("message_id") if isinstance(result, dict) else None
         if isinstance(receipt, (str, int)):
             details = {**details, "receipt_id": str(receipt)[:128]}
         event.set_extra("_jev_delivery_state", "completed")
-        self._note(event, "send_completed", details)
+        for request in requests:
+            request.status = "delivered"
+            request.receipt = result
+        self._note(event, "send_completed", {**details, "delivery_state": "delivered"})
         return result
 
     def _install_sender(self, event):
@@ -738,16 +766,7 @@ class JevActiveReply(Star):
                 if not await self._permit(event):
                     await self._context_failure_reply(event)
                     raise DeliveryDeclined("autonomous_delivery_cancelled")
-                try:
-                    receipt = await transmit(event.bot.call_action, (action,), params)
-                except BaseException:
-                    for request in native_requests:
-                        request.status = "failed"
-                    raise
-                else:
-                    for request in native_requests:
-                        request.status = "delivered"
-                        request.receipt = receipt
+                await transmit(event.bot.call_action, (action,), params)
             else:
                 chain = event.chain_result(
                     [
@@ -869,6 +888,8 @@ class JevActiveReply(Star):
                 fragments.append(slot)
                 if not native and chain is event.get_result():
                     event.set_extra("_jev_collected_result", chain)
+                if not event.get_extra("_jev_delivery_state"):
+                    self._note(event, "send_queued", {"delivery_state": "queued"})
                 event.set_extra("_jev_delivery_state", "queued")
                 collectors.add(task)
                 idle.clear()
@@ -1022,6 +1043,7 @@ class JevActiveReply(Star):
             if previous.takeover:
                 event.set_extra("_jev_takeover", True)
             if old and (old_meta or old.get_extra("_jev_candidate_running")):
+                old.set_extra("_jev_admission_cancelled", True)
                 old.set_extra("agent_stop_requested", True)
                 old.stop_event()
                 if old_meta:
@@ -1242,6 +1264,7 @@ class JevActiveReply(Star):
                 self._note(event, "room_capacity_native_wake")
                 return
             event.set_extra("_jev_takeover", True)
+            event.set_extra("_jev_turn_id", uuid.uuid4().hex)
             event.set_extra("_jev_context_failure_sender", event.send)
             event.set_extra(
                 "_jev_complete_output", lambda: self._context_failure_reply(event)
@@ -1258,6 +1281,8 @@ class JevActiveReply(Star):
             self._note(event, "admission_failed")
         finally:
             if not event.get_extra(MARK):
+                if event.get_extra("_jev_takeover"):
+                    event.set_extra("_jev_admission_failed", True)
                 await self._context_failure_reply(event)
             if (owned or event.get_extra("_jev_takeover")) and not event.get_extra(
                 MARK
@@ -1523,7 +1548,7 @@ class JevActiveReply(Star):
         ):
             self._note(event, "daily_budget")
             return
-        ticket = uuid.uuid4().hex
+        ticket = event.get_extra("_jev_turn_id") or uuid.uuid4().hex
         if (
             (not required and generation != room.generation)
             or self._blocked(event)
@@ -1680,6 +1705,7 @@ class JevActiveReply(Star):
             if fresh_cid != cid or (
                 not required and bridge.fingerprint(conv) != history_hash
             ):
+                event.set_extra("_jev_admission_cancelled", True)
                 self._note(event, "conversation_changed")
                 return
             settings = self.context.get_config(umo=umo)
@@ -1725,6 +1751,7 @@ class JevActiveReply(Star):
                     "generation": generation,
                     "approved_generation": generation,
                     "output_ready": False,
+                    "required_delivery": required,
                 },
             )
             event.set_extra("_active_trigger", True)
@@ -1836,20 +1863,11 @@ class JevActiveReply(Star):
             else:
                 self._reject(event, None, "request_lease_expired")
 
-    @staticmethod
-    def _resume_required(event):
+    def _resume_required(self, event):
         if (
             event.is_stopped()
             and not event.get_extra(MARK, {}).get("sent_parts")
-            and not any(
-                event.get_extra(key)
-                for key in (
-                    silence.RECALL,
-                    silence.SILENT,
-                    "agent_stop_requested",
-                    "_suanle_silent_requested",
-                )
-            )
+            and not self._blocked(event)
         ):
             event.continue_event()
 
@@ -1894,14 +1912,16 @@ class JevActiveReply(Star):
                         event.set_result(event.chain_result([]))
                 if flush and not self._blocked(event):
                     await flush()
-                if not meta.get("sent_parts") and not self._blocked(event):
-                    meta["reviewed"] = meta["output_ready"] = True
-                    await event.send(event.plain_result(silence.FALLBACK_REPLY))
             self._note(
                 event, "request_timeout_completed" if expired else "output_completed"
             )
-        except Exception:
+        except Exception as exc:
             state = event.get_extra("_jev_delivery_state", "queued")
+            if state not in {"started", "uncertain", "completed"}:
+                state = "cancelled" if isinstance(exc, DeliveryDeclined) else "failed"
+                event.set_extra("_jev_delivery_state", state)
+                for request in event.get_extra("_jev_native_requests", []):
+                    request.status = state
             self._note(
                 event,
                 "output_completion_uncertain"
@@ -1911,6 +1931,9 @@ class JevActiveReply(Star):
             )
         finally:
             meta["finished"] = True
+            if event.get_extra("_jev_delivery_state") == "queued":
+                event.set_extra("_jev_delivery_state", "cancelled")
+                self._note(event, "delivery_cancelled", {"delivery_state": "cancelled"})
             for request in event.get_extra("_jev_native_requests", []):
                 if request.status == "queued":
                     request.status = "cancelled"
@@ -2351,10 +2374,11 @@ class JevActiveReply(Star):
             return
         if await self._finish_expired(event, "output_cancelled"):
             return
-        flush = event.get_extra("_jev_flush_output")
-        if flush and not self._blocked(event):
-            await flush()
-        if meta["rejected"] or not meta["reviewed"] or self._blocked(event):
+        if (
+            meta["rejected"]
+            or (not self._must_reply(event) and not meta["reviewed"])
+            or self._blocked(event)
+        ):
             self._reject(event, None, "output_cancelled")
             return
         result = event.get_result()
@@ -2389,9 +2413,6 @@ class JevActiveReply(Star):
         meta = event.get_extra(MARK)
         if not meta:
             return
-        flush = event.get_extra("_jev_flush_output")
-        if flush and not self._blocked(event):
-            await flush()
         result = event.get_result()
         if (
             result is not None

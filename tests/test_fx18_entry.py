@@ -309,7 +309,7 @@ async def test_completion_failure_records_transport_phase(env, monkeypatch, star
         if started
         else "output_completion_failed_before_send"
     ) in reasons
-    assert request.status == ("failed" if started else "cancelled")
+    assert request.status == ("uncertain" if started else "failed")
     assert event.get_extra(MARK)["finished"]
     assert not env.plugin.rooms.get(event.unified_msg_origin).pending
     await env.plugin._complete_output(event)

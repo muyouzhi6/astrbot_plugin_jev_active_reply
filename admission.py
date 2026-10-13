@@ -220,6 +220,54 @@ def input_decision(event, config, recent_bot_text="", prefixes=()):
     ).strip()
     first = plain.split(maxsplit=1)[0] if plain else ""
     command = first.lstrip("/!！")
+    # Identify explicit wakes before ordinary content filters. A direct call is
+    # a request for an answer, even when its text repeats the last bot reply or
+    # contains a word filtered from autonomous chatter.
+    at_self = any(type(p).__name__ == "At" and str(p.qq) == bot for p in parts)
+    reply_self = any(
+        type(p).__name__ == "Reply" and str(getattr(p, "sender_id", "")) == bot
+        for p in parts
+    )
+    directed_other = any(
+        type(p).__name__ == "AtAll" or (type(p).__name__ == "At" and str(p.qq) != bot)
+        for p in parts
+    )
+    reply_other = any(
+        type(p).__name__ == "Reply" and str(getattr(p, "sender_id", "")) != bot
+        for p in parts
+    )
+    aliases = [str(n).strip() for n in config.get("wake_names", []) if str(n).strip()]
+    if event.is_admin():
+        aliases += [
+            str(n).strip() for n in config.get("admin_wake_names", []) if str(n).strip()
+        ]
+    named = False
+    remainder = plain
+    for alias in sorted(set(aliases), key=len, reverse=True):
+        match = re.match(
+            r"^"
+            + re.escape(alias)
+            + r"(?=$|[\s,，:：!?！？。~～]|在|帮|你|能|可以|我|给|怎么|别|不要|闭嘴|停)",
+            plain,
+            re.IGNORECASE,
+        )
+        if match:
+            named = True
+            remainder = plain[match.end() :].strip(" ,，:：!！?？。~～")
+            break
+    protected = (
+        config.get("takeover_wake_messages", False)
+        or (event.is_private_chat() and config.get("enable_private_chat", False))
+    ) and (
+        event.is_private_chat()
+        or at_self
+        or (reply_self and config.get("reply_to_bot_wakes", True))
+        or (
+            named
+            and not directed_other
+            and not (reply_other and config.get("skip_reply_to_others", False))
+        )
+    )
     if command in {
         "jev状态",
         "jev诊断",
@@ -250,12 +298,13 @@ def input_decision(event, config, recent_bot_text="", prefixes=()):
                 )
             ):
                 return "block", "official_bot"
-        if any(
+        if not protected and any(
             word and str(word) in plain for word in config.get("blocked_keywords", [])
         ):
             return "block", "blocked_keyword"
         if (
-            config.get("block_repeated_input", True)
+            not protected
+            and config.get("block_repeated_input", True)
             and normalize(plain)
             and recent_bot_text
             and normalize(plain) == normalize(recent_bot_text)
@@ -271,19 +320,6 @@ def input_decision(event, config, recent_bot_text="", prefixes=()):
                 "block_prefixed_commands" if registered else "block_prefixed_llm", False
             ):
                 return "block", "blocked_prefix"
-    at_self = any(type(p).__name__ == "At" and str(p.qq) == bot for p in parts)
-    reply_self = any(
-        type(p).__name__ == "Reply" and str(getattr(p, "sender_id", "")) == bot
-        for p in parts
-    )
-    directed_other = any(
-        type(p).__name__ == "AtAll" or (type(p).__name__ == "At" and str(p.qq) != bot)
-        for p in parts
-    )
-    reply_other = any(
-        type(p).__name__ == "Reply" and str(getattr(p, "sender_id", "")) != bot
-        for p in parts
-    )
     if not (at_self or reply_self) and directed_other:
         return "skip", "addressed_elsewhere"
     if (
@@ -292,25 +328,6 @@ def input_decision(event, config, recent_bot_text="", prefixes=()):
         and config.get("skip_reply_to_others", False)
     ):
         return "skip", "quoted_elsewhere"
-    aliases = [str(n).strip() for n in config.get("wake_names", []) if str(n).strip()]
-    if event.is_admin():
-        aliases += [
-            str(n).strip() for n in config.get("admin_wake_names", []) if str(n).strip()
-        ]
-    named = False
-    remainder = plain
-    for alias in sorted(set(aliases), key=len, reverse=True):
-        match = re.match(
-            r"^"
-            + re.escape(alias)
-            + r"(?=$|[\s,，:：!?！？。~～]|在|帮|你|能|可以|我|给|怎么|别|不要|闭嘴|停)",
-            plain,
-            re.IGNORECASE,
-        )
-        if match:
-            named = True
-            remainder = plain[match.end() :].strip(" ,，:：!！?？。~～")
-            break
     explicit = at_self or reply_self or named
     if explicit and config.get("respect_quiet_requests", True):
         stop = r"(?:闭嘴|别说话|不要说话|别回复|不要回复|别吵|别插嘴|别打扰我|先安静|安静一会|停一下)(?:了|吧|好吗|谢谢)?[。.!！?？\s]*"

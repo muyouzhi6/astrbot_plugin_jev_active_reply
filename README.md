@@ -129,7 +129,7 @@ Jev 本身是文字判断模型，不识别图片像素。毫无配文和对话�
 
 发送保护接入 AstrBot 原生事件、Agent 与平台发送链；第三方插件直接调用独立机器人客户端时由其管理发送。
 
-接管事件上的原生 `bot.send_*` 调用返回 `QueuedDelivery` 入队确认，`status` 初始为 `queued`，不是平台回执。整轮结束后统一发送，成功时 `status=delivered`，`receipt` 保存平台返回值（含 `message_id`）；此时也可用 `get("message_id")` 或索引读取，投递前 `get` 返回 `None`。发送失败为 `failed`，发送前取消为 `cancelled`。依赖消息 ID 的扩展应在整轮结束后读取回执，不要在生成或装饰回调中等待整轮结束。内置 `send_message_to_user` 对当前会话的调用也使用同一发送队列；异会话收件目标和无法合并的原生参数抛出 `DeliveryDeclined`，不会改投当前会话。接管关闭时原生 API 返回行为不变。
+接管事件上的原生 `bot.send_*` 调用返回 `QueuedDelivery` 入队确认，`status` 初始为 `queued`。整轮结束后统一发送，平台调用开始时为 `platform_started`，成功后为 `delivered`，`receipt` 保存平台返回值（含 `message_id`）；此时也可用 `get("message_id")` 或索引读取，投递前 `get` 返回 `None`。发送前失败为 `failed`，取消为 `cancelled`；平台调用后异常为 `uncertain`，此时不要自动重发，以免重复投递。依赖消息 ID 的扩展应在整轮结束后读取回执，不要在生成或装饰回调中等待整轮结束。内置 `send_message_to_user` 对当前会话的调用也使用同一发送队列；异会话收件目标和无法合并的原生参数抛出 `DeliveryDeclined`，不会改投当前会话。接管关闭时原生 API 返回行为不变。
 
 ## 常见问题
 

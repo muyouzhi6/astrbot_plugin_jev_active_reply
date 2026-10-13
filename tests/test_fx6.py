@@ -172,7 +172,7 @@ async def test_completion_waits_for_transport(env, monkeypatch, expired, fail):
         assert not event.get_extra(MARK).get("finished")
         release.set()
         results = await asyncio.gather(sending, finishing, return_exceptions=True)
-        assert results[0].status == ("failed" if fail else "delivered")
+        assert results[0].status == ("uncertain" if fail else "delivered")
         assert results[1] is None
         assert bot.transport.await_count == 1
         assert event.get_extra(MARK)["finished"]
