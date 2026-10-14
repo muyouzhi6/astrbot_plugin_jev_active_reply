@@ -422,6 +422,8 @@ class SplitAdapters:
                     return await type(_step).handle(clone, ctx)
                 except (DeliveryDeclined, PipelineDeliveryCancelled) as exc:
                     ctx.chain.clear()
+                    # Core 4.26.8 runs after-sent hooks even for an empty result.
+                    ctx.event.clear_result()
                     _finish_cancel(ctx.event, str(exc))
                     return SimpleNamespace(
                         ok=True, abort=True, msg="Autonomous delivery cancelled"

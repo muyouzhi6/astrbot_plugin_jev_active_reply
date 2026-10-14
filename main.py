@@ -2855,7 +2855,7 @@ class JevActiveReply(Star):
             await asyncio.shield(self.audit_task)
         pools = [pool.status() for pool in self.client.pools.values()]
         lines = [
-            "Jev 主动回复插件 0.10.7 · 木有知",
+            "Jev 主动回复插件 0.10.8 · 木有知",
             f"当前会话：{'已启用' if self._enabled(event) else '未启用'}",
         ]
         names = {

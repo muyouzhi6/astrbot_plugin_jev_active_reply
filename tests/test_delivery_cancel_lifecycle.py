@@ -9,6 +9,12 @@ import pytest
 from astrbot.api.message_components import Plain
 from astrbot.core.pipeline.respond import stage as core_respond
 from astrbot.core.pipeline.respond.stage import RespondStage
+from astrbot.core.star.star import star_map
+from astrbot.core.star.star_handler import (
+    EventType,
+    StarHandlerMetadata,
+    star_handlers_registry,
+)
 
 from .. import delivery, silence
 from ..main import MARK
@@ -110,19 +116,25 @@ async def test_scheduler_cancel_releases_turn_and_admits_followup(
 
 
 @pytest.mark.asyncio
-async def test_split_cancel_releases_turn_before_returning(env):
+@pytest.mark.parametrize("cancel_at", [0, 1, 2])
+async def test_split_cancel_releases_turn_before_returning(env, monkeypatch, cancel_at):
     event, bot = await prepared_reply(env)
     lease = event.get_extra(MARK)["lease"]
-    event.set_extra(silence.RECALL, True)
+    after_sent = AsyncMock(wraps=core_respond.call_event_hook)
+    monkeypatch.setattr(core_respond, "call_event_hook", after_sent)
 
     class SplitStep:
         def __init__(self):
             self.plugin_config = SimpleNamespace(context=SimpleNamespace())
 
         async def handle(self, ctx):
-            await self.plugin_config.context.send_message(
-                ctx.event.unified_msg_origin, ctx.event.plain_result("First segment")
-            )
+            for index in range(3):
+                if index == cancel_at:
+                    ctx.event.set_extra(silence.RECALL, True)
+                await self.plugin_config.context.send_message(
+                    ctx.event.unified_msg_origin,
+                    ctx.event.plain_result(f"Segment {index}"),
+                )
             raise AssertionError("Later segment reached")
 
     step = SplitStep()
@@ -135,9 +147,123 @@ async def test_split_cancel_releases_turn_before_returning(env):
     finally:
         adapter.restore()
 
-    assert result.abort and bot.transport.await_count == 0
-    assert event.get_extra("_jev_delivery_state") == "cancelled"
+    assert result.abort and bot.transport.await_count == cancel_at
+    assert event.get_extra("_jev_delivery_state") == (
+        "completed" if cancel_at else "cancelled"
+    )
+    assert event.get_extra(MARK).get("sent_parts", 0) == cancel_at
     assert_released(env.plugin, event, lease)
+    await (await respond_stage()).process(event)
+    after_sent.assert_not_awaited()
+    assert bot.transport.await_count == cancel_at
+    assert await env.plugin.ledger.acount(
+        event.unified_msg_origin, "sent"
+    ) == bool(cancel_at)
+    assert env.plugin.metrics.replies == bool(cancel_at)
+    assert env.plugin.metrics.failures == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("priority", [0, -200000])
+async def test_split_cancel_skips_core_after_sent_and_admits_followup(
+    env, monkeypatch, delivery_hooks, priority
+):
+    wake.configure(env)
+    wake.judge_result(env, "reply")
+    event, bot = adapter_event("natural")
+    after_sent = AsyncMock(wraps=core_respond.call_event_hook)
+    monkeypatch.setattr(core_respond, "call_event_hook", after_sent)
+    errors, snapshots = [], []
+    monkeypatch.setattr(
+        core_respond.logger, "error", lambda *args, **kwargs: errors.append(kwargs)
+    )
+
+    class SplitStep:
+        def __init__(self):
+            self.plugin_config = SimpleNamespace(context=SimpleNamespace())
+
+        async def handle(self, ctx):
+            ctx.event.set_extra(silence.RECALL, True)
+            await self.plugin_config.context.send_message(
+                ctx.event.unified_msg_origin,
+                ctx.event.plain_result("Cancelled segment"),
+            )
+            raise AssertionError("Later segment reached")
+
+    step = SplitStep()
+    adapter = delivery.SplitAdapters(MARK)
+    adapter.attach(SimpleNamespace(pipeline=SimpleNamespace(_steps=[step])))
+
+    async def split_hook(ev):
+        if ev is event:
+            metrics = env.plugin.metrics
+            snapshots.append(
+                (
+                    ev.get_extra(MARK)["lease"],
+                    (metrics.replies, metrics.failures, metrics.cancelled),
+                )
+            )
+            result = await step.handle(
+                SimpleNamespace(event=ev, chain=ev.get_result().chain)
+            )
+            assert result.abort
+
+    module = "lifecycle_splitter"
+    monkeypatch.setitem(
+        star_map,
+        module,
+        SimpleNamespace(name=module, activated=True, reserved=False),
+    )
+    star_handlers_registry.append(
+        StarHandlerMetadata(
+            EventType.OnDecoratingResultEvent,
+            module + "_split",
+            "split",
+            module,
+            split_hook,
+            [],
+            extras_configs={"priority": priority},
+        )
+    )
+    try:
+        await run_scheduler(env, event, monkeypatch)
+    finally:
+        adapter.restore()
+
+    room = env.plugin.rooms.get(event.unified_msg_origin)
+    cancel_hook_calls = after_sent.await_count
+    has_backoff = room.delivery_backoff_until > time.monotonic()
+    assert bot.transport.await_count == 0
+    assert event.get_extra("_jev_delivery_state") == "cancelled"
+    assert len(snapshots) == 1
+    lease, counters = snapshots[0]
+    assert_released(env.plugin, event, lease)
+    metrics = env.plugin.metrics
+    assert (metrics.replies, metrics.failures, metrics.cancelled) == counters
+    assert await env.plugin.ledger.acount(event.unified_msg_origin, "sent") == 0
+
+    room.evaluated_at -= 60
+    following, following_bot = adapter_event("natural")
+    following.message_obj.message_id = "followup-after-split-cancel"
+    env.plugin.client.evaluate.reset_mock()
+    await run_scheduler(env, following, monkeypatch)
+
+    assert (
+        cancel_hook_calls,
+        has_backoff,
+        bool(following.get_extra(MARK)),
+        following_bot.transport.await_count,
+    ) == (
+        0,
+        False,
+        True,
+        1,
+    )
+    assert event.get_result() is None
+    assert not room.pending
+    assert env.plugin.client.evaluate.await_count > 0
+    assert following.get_extra(MARK)["finished"]
+    assert not errors
 
 
 @pytest.mark.asyncio
