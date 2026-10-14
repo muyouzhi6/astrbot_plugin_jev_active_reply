@@ -434,6 +434,16 @@ class JevActiveReply(Star):
         if room:
             room.release(meta["ticket"])
 
+    def _finish_cancelled_delivery(self, event):
+        meta = event.get_extra(MARK)
+        if not meta:
+            return
+        meta["finished"] = True
+        for request in event.get_extra("_jev_native_requests", []):
+            if request.status == "queued":
+                request.status = "cancelled"
+        self._release(event)
+
     async def _permit(self, event):
         meta = event.get_extra(MARK)
         room = self.rooms.rooms.get(event.unified_msg_origin)
@@ -682,6 +692,9 @@ class JevActiveReply(Star):
 
     def _install_sender(self, event):
         original_send = event.send
+        event.set_extra(
+            "_jev_cancel_delivery", lambda: self._finish_cancelled_delivery(event)
+        )
         nested = ContextVar("jev_delivery_owner", default=None)
         fragments = []
         native_requests = []
@@ -2842,7 +2855,7 @@ class JevActiveReply(Star):
             await asyncio.shield(self.audit_task)
         pools = [pool.status() for pool in self.client.pools.values()]
         lines = [
-            "Jev 主动回复插件 0.10.6 · 木有知",
+            "Jev 主动回复插件 0.10.7 · 木有知",
             f"当前会话：{'已启用' if self._enabled(event) else '未启用'}",
         ]
         names = {

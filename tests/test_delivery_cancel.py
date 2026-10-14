@@ -61,6 +61,7 @@ def watch_core(monkeypatch):
 @pytest.mark.parametrize("kind", ["natural", "at", "private"])
 async def test_core_respond_cancel_skips_error_and_after_sent(env, monkeypatch, kind):
     event, bot = await prepared_reply(env, kind)
+    lease = event.get_extra(MARK)["lease"]
     previous_send = event.send
     wrapper_errors = []
 
@@ -89,6 +90,10 @@ async def test_core_respond_cancel_skips_error_and_after_sent(env, monkeypatch, 
     assert not errors and not wrapper_errors
     assert bot.transport.await_count == 0
     assert event.get_extra(MARK)["rejected"]
+    assert event.get_extra(MARK)["finished"]
+    assert not env.plugin.rooms.get(event.unified_msg_origin).pending
+    assert event.get_extra(MARK)["ticket"] not in env.plugin.pending_events
+    assert "lease" not in event.get_extra(MARK) and lease.cancelled()
     assert event.get_extra("_jev_delivery_state") == "cancelled"
     assert event.get_result() is None
     assert (metrics.replies, metrics.failures, metrics.cancelled) == counters

@@ -20,6 +20,9 @@ _cancel_scope_event = ContextVar("jev_cancel_scope_event", default=None)
 def _finish_cancel(event, reason):
     if event.get_extra("_jev_delivery_state") in (None, "queued"):
         event.set_extra("_jev_delivery_state", "cancelled")
+    finish = event.get_extra("_jev_cancel_delivery")
+    if finish is not None:
+        finish()
     logger.info(
         "[JevActive] delivery cancelled reason=%s session=%s",
         reason,
