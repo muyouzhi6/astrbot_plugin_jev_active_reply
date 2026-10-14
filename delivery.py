@@ -2,14 +2,29 @@
 
 import copy
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
 from types import SimpleNamespace
 
 from aiocqhttp.message import Message
+from astrbot.api import logger
 from astrbot.api.message_components import Node, Nodes
 
 from . import silence
+
+
+_cancel_scope_event = ContextVar("jev_cancel_scope_event", default=None)
+
+
+def _finish_cancel(event, reason):
+    if event.get_extra("_jev_delivery_state") in (None, "queued"):
+        event.set_extra("_jev_delivery_state", "cancelled")
+    logger.info(
+        "[JevActive] delivery cancelled reason=%s session=%s",
+        reason,
+        event.unified_msg_origin,
+    )
 
 
 async def plan_onebot(event, fragments):
@@ -139,7 +154,15 @@ def install_completion_adapter():
             # A required turn submits once; Core's per-part delays cannot apply.
             stage = copy.copy(stage)
             stage.enable_seg = False
-        return await original_respond(stage, event)
+        token = _cancel_scope_event.set(event)
+        try:
+            return await original_respond(stage, event)
+        except PipelineDeliveryCancelled as exc:
+            event.clear_result()
+            _finish_cancel(event, str(exc))
+            return None
+        finally:
+            _cancel_scope_event.reset(token)
 
     RespondStage.process = respond
 
@@ -169,6 +192,14 @@ def install_native_reply_guard(event):
 
 class DeliveryDeclined(Exception):
     pass
+
+
+class PipelineDeliveryCancelled(BaseException):
+    """Exit Core or a split sender before their Exception error handlers."""
+
+
+def in_cancel_scope(event):
+    return _cancel_scope_event.get() is event
 
 
 def is_message_action(action):
@@ -350,6 +381,8 @@ class ScopedContext:
 
     async def send_message(self, umo, chain, **kwargs):
         if str(umo) != str(self._event.unified_msg_origin):
+            if in_cancel_scope(self._event):
+                raise PipelineDeliveryCancelled("autonomous_cross_session_send")
             raise DeliveryDeclined("autonomous_cross_session_send")
         await self._event.send(chain)
         return True
@@ -381,13 +414,17 @@ class SplitAdapters:
                     _step.plugin_config.context, ctx.event
                 )
                 clone.context = clone.plugin_config.context
+                token = _cancel_scope_event.set(ctx.event)
                 try:
                     return await type(_step).handle(clone, ctx)
-                except DeliveryDeclined:
+                except (DeliveryDeclined, PipelineDeliveryCancelled) as exc:
                     ctx.chain.clear()
+                    _finish_cancel(ctx.event, str(exc))
                     return SimpleNamespace(
                         ok=True, abort=True, msg="Autonomous delivery cancelled"
                     )
+                finally:
+                    _cancel_scope_event.reset(token)
 
             step.handle = scoped
             self.installed.append((step, original, scoped))

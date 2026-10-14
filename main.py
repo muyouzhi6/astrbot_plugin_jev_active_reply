@@ -42,6 +42,7 @@ from .admission import (
 from .client import DecisionError, JevClient
 from .delivery import (
     DeliveryDeclined,
+    PipelineDeliveryCancelled,
     EventBotProxy,
     QueuedDelivery,
     native_delivery,
@@ -49,6 +50,7 @@ from .delivery import (
     install_completion_adapter,
     install_native_reply_guard,
     install_send_tool_adapter,
+    in_cancel_scope,
     plan_onebot,
 )
 from .policy import (
@@ -923,7 +925,12 @@ class JevActiveReply(Star):
             return await transmit(operation, args, kwargs, native)
 
         async def send(chain, *args, **kwargs):
-            return await send_operation(original_send, (chain, *args), kwargs)
+            try:
+                return await send_operation(original_send, (chain, *args), kwargs)
+            except DeliveryDeclined as exc:
+                if in_cancel_scope(event):
+                    raise PipelineDeliveryCancelled(str(exc)) from None
+                raise
 
         async def native_send(operation, *args, _jev_action=None, **kwargs):
             meta = event.get_extra(MARK)
@@ -2835,7 +2842,7 @@ class JevActiveReply(Star):
             await asyncio.shield(self.audit_task)
         pools = [pool.status() for pool in self.client.pools.values()]
         lines = [
-            "Jev 主动回复插件 0.10.5 · 木有知",
+            "Jev 主动回复插件 0.10.6 · 木有知",
             f"当前会话：{'已启用' if self._enabled(event) else '未启用'}",
         ]
         names = {
