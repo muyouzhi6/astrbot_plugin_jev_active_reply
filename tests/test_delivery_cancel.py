@@ -1,5 +1,6 @@
 """Cancellation handling at the real Core respond-stage boundary."""
 
+import asyncio
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -228,3 +229,117 @@ async def test_real_send_failure_still_raises_outside_respond(env):
 
     with pytest.raises(RuntimeError, match="synthetic transport failure"):
         await event.send(event.plain_result("Synthetic answer"))
+
+
+@pytest.mark.asyncio
+async def test_taskgroup_wrapped_cancel_is_consumed_by_respond(env, monkeypatch):
+    """A third-party TaskGroup wrapper must not leak cancellation groups to Core."""
+    event, bot = await prepared_reply(env)
+    original_send = event.send
+
+    async def wrapped_send(chain):
+        async with asyncio.TaskGroup() as group:
+            task = group.create_task(original_send(chain))
+        return task.result()
+
+    event.send = wrapped_send
+    env.cid = "conversation-changed-inside-taskgroup"
+    errors, after_sent = watch_core(monkeypatch)
+
+    await (await respond_stage()).process(event)
+
+    assert not errors
+    assert not after_sent.await_count
+    assert bot.transport.await_count == 0
+    assert event.get_extra("_jev_delivery_state") == "cancelled"
+    meta = event.get_extra(MARK)
+    assert meta["finished"]
+    assert not env.plugin.rooms.get(event.unified_msg_origin).pending
+    assert "lease" not in meta
+
+
+@pytest.mark.asyncio
+async def test_taskgroup_wrapped_real_error_still_reaches_core(env, monkeypatch):
+    event, bot = await prepared_reply(env)
+    original_send = event.send
+
+    async def wrapped_send(chain):
+        async with asyncio.TaskGroup() as group:
+            task = group.create_task(original_send(chain))
+        return task.result()
+
+    event.send = wrapped_send
+    bot.transport.side_effect = RuntimeError("synthetic taskgroup failure")
+    errors, after_sent = watch_core(monkeypatch)
+
+    await (await respond_stage()).process(event)
+
+    assert len(errors) == 1
+    assert "TaskGroup" in errors[0][0]
+    assert errors[0][1]["exc_info"] is True
+    assert bot.transport.await_count == 1
+    after_sent.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_taskgroup_wrapped_split_cancel_is_consumed(env):
+    event, bot = await prepared_reply(env)
+    event.set_extra(delivery.silence.RECALL, True)
+
+    class SplitStep:
+        def __init__(self):
+            self.plugin_config = SimpleNamespace(context=SimpleNamespace())
+
+        async def handle(self, ctx):
+            async with asyncio.TaskGroup() as group:
+                group.create_task(
+                    self.plugin_config.context.send_message(
+                        ctx.event.unified_msg_origin,
+                        ctx.event.plain_result("Cancelled segment"),
+                    )
+                )
+
+    step = SplitStep()
+    adapter = delivery.SplitAdapters(MARK)
+    adapter.attach(SimpleNamespace(pipeline=SimpleNamespace(_steps=[step])))
+    ctx = SimpleNamespace(event=event, chain=event.get_result().chain)
+    try:
+        result = await step.handle(ctx)
+    finally:
+        adapter.restore()
+
+    assert result.abort
+    assert not ctx.chain
+    assert bot.transport.await_count == 0
+    assert event.get_extra("_jev_delivery_state") == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_mixed_exception_group_still_raises_from_respond(env, monkeypatch):
+    event, bot = await prepared_reply(env)
+    original_send = event.send
+    failures = []
+
+    async def wrapped_send(chain):
+        try:
+            async with asyncio.TaskGroup() as group:
+                group.create_task(original_send(chain))
+        except BaseExceptionGroup as exc:
+            failure = BaseExceptionGroup(
+                "wrapper cleanup failed", [exc, RuntimeError("real failure")]
+            )
+            failures.append(failure)
+            raise failure
+
+    event.send = wrapped_send
+    env.cid = "conversation-changed-inside-taskgroup"
+    errors, after_sent = watch_core(monkeypatch)
+
+    with pytest.raises(BaseExceptionGroup) as raised:
+        await (await respond_stage()).process(event)
+
+    assert raised.value is failures[0]
+    assert str(raised.value.exceptions[1]) == "real failure"
+    assert bot.transport.await_count == 0
+    assert not errors
+    after_sent.assert_not_awaited()

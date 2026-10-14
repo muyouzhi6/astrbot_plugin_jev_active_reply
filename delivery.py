@@ -164,6 +164,13 @@ def install_completion_adapter():
             event.clear_result()
             _finish_cancel(event, str(exc))
             return None
+        except BaseExceptionGroup as exc:
+            reason = cancellation_reason(exc)
+            if reason is None:
+                raise
+            event.clear_result()
+            _finish_cancel(event, reason)
+            return None
         finally:
             _cancel_scope_event.reset(token)
 
@@ -199,6 +206,23 @@ class DeliveryDeclined(Exception):
 
 class PipelineDeliveryCancelled(BaseException):
     """Exit Core or a split sender before their Exception error handlers."""
+
+
+def cancellation_reason(error):
+    """Return a reason when *error* contains cancellation signals only.
+
+    ``asyncio.TaskGroup`` aggregates ``BaseException`` failures, so a
+    ``PipelineDeliveryCancelled`` raised by a wrapped ``event.send`` arrives as
+    a ``BaseExceptionGroup``.  A group containing any real failure must keep
+    propagating to the caller.
+    """
+    if isinstance(error, (DeliveryDeclined, PipelineDeliveryCancelled)):
+        return str(error)
+    if isinstance(error, BaseExceptionGroup):
+        reasons = [cancellation_reason(child) for child in error.exceptions]
+        if reasons and all(reason is not None for reason in reasons):
+            return next((reason for reason in reasons if reason), "cancelled")
+    return None
 
 
 def in_cancel_scope(event):
@@ -425,6 +449,17 @@ class SplitAdapters:
                     # Core 4.26.8 runs after-sent hooks even for an empty result.
                     ctx.event.clear_result()
                     _finish_cancel(ctx.event, str(exc))
+                    return SimpleNamespace(
+                        ok=True, abort=True, msg="Autonomous delivery cancelled"
+                    )
+                except BaseExceptionGroup as exc:
+                    reason = cancellation_reason(exc)
+                    if reason is None:
+                        raise
+                    ctx.chain.clear()
+                    # Core 4.26.8 runs after-sent hooks even for an empty result.
+                    ctx.event.clear_result()
+                    _finish_cancel(ctx.event, reason)
                     return SimpleNamespace(
                         ok=True, abort=True, msg="Autonomous delivery cancelled"
                     )
